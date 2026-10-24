@@ -258,15 +258,13 @@ async def send_video(update, ctx, path, td, caption=None):
                                                       width=wid, height=hei, supports_streaming=True,
                                                       read_timeout=600, write_timeout=600, connect_timeout=300)
 
-_no_delete = set()   # jis message ko user use kar liya, use rehne do
 async def _delete_after(msg, delay=600):
     try:
         await asyncio.sleep(delay)
-        if msg.message_id in _no_delete:
-            return
         await msg.delete()
-    except Exception:
-        pass
+        log.info("deleted msg id=%s (10min)", msg.message_id)
+    except Exception as e:
+        log.error("delete fail id=%s: %s", getattr(msg, "message_id", "?"), e)
 
 def delete_later(msg, delay=600):
     try:
