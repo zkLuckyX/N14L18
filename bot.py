@@ -189,9 +189,12 @@ async def send_video(update, ctx, path, td, caption=None):
                                                       width=wid, height=hei, supports_streaming=True,
                                                       read_timeout=600, write_timeout=600, connect_timeout=300)
 
+_no_delete = set()   # jis message ko user use kar liya, use rehne do
 async def _delete_after(msg, delay=600):
     try:
         await asyncio.sleep(delay)
+        if msg.message_id in _no_delete:
+            return
         await msg.delete()
     except Exception:
         pass
@@ -410,6 +413,7 @@ async def on_button(update: Update, ctx):
     elif d == "stathelp":
         await q.message.reply_text("stats dekhne ko: /stats")
     elif d.startswith("ck_"):
+        _no_delete.add(q.message.message_id)   # user ne select kar liya, menu rehne do
         p = pending.get(q.from_user.id, {})
         opts = p.get("opts", [])
         url = p.get("url")
