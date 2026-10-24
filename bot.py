@@ -555,7 +555,6 @@ async def on_button(update: Update, ctx):
     elif d == "stathelp":
         await q.message.reply_text("stats dekhne ko: /stats")
     elif d.startswith("ck_"):
-        _no_delete.add(q.message.message_id)   # user ne select kar liya, menu rehne do
         p = pending.get(q.from_user.id, {})
         opts = p.get("opts", [])
         url = p.get("url")
