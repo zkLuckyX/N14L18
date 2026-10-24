@@ -38,7 +38,7 @@ def run_ytdlp(url, td, fmt, mp3=False):
            "--retries", "5", "--fragment-retries", "5",
            "--file-access-retries", "5", "--concurrent-fragments", "8",
            "--no-warnings", "--socket-timeout", "20",
-           "--extractor-args", "youtube:player_client=android_vr,tv", url]
+           "--extractor-args", "youtube:player_client=android,android_vr,web_safari", url]
     if mp3:
         cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
     else:
