@@ -164,12 +164,38 @@ def _keepalive():
         log.warning(f"keepalive off: {e}")
 _th.Thread(target=_keepalive, daemon=True).start()
 
+async def debug_yt(update: Update, ctx):
+    url = first_url(update.message.text)
+    if not url:
+        await update.message.reply_text("/debug <youtube link>")
+        return
+    await update.message.reply_text("render ke andar se check kar raha hoon...")
+    td = tempfile.mkdtemp()
+    try:
+        cookie_env = os.environ.get("YOUTUBE_COOKIES", "").strip()
+        cf = ""
+        if cookie_env:
+            cf = os.path.join(td, "c.txt")
+            open(cf, "w").write(cookie_env.replace("\\n", "\n"))
+        cmd = ["yt-dlp", "-F", "--no-playlist", "--verbose"]
+        if cf:
+            cmd += ["--cookies", cf]
+        cmd.append(url)
+        env = dict(os.environ); env["DENO_DIR"] = "/tmp/deno"; env["XDG_CACHE_HOME"] = "/tmp/xdg"
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+        out = (r.stdout + "\n" + r.stderr)[-3500:]
+        deno = subprocess.run(["bash", "-lc", "which deno && deno --version"], capture_output=True, text=True)
+        await update.message.reply_text("DENO: " + (deno.stdout or deno.stderr)[-200:] + "\n\n" + out)
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
 def main():
     ytdlp_version_check()
     app = Application.builder().token(TOKEN).concurrent_updates(True).build()
     app.bot_data["pool"] = ThreadPoolExecutor(max_workers=2)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("audio", handle_audio))
+    app.add_handler(CommandHandler("debug", debug_yt))
     app.add_handler(MessageHandler(filters.TEXT, handle_video))
     log.info("bot live")
     app.run_polling()
