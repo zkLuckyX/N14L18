@@ -181,7 +181,7 @@ def run_ytdlp(url, td, fmt, mp3=False, subs=False, extra=None, prog=None):
     r.wait()
     if r.returncode != 0:
         raise RuntimeError((err_tail[0] if err_tail else "").strip()[-300:])
-    files = sorted(f for f in os.listdir(td) if f.startswith("file."))
+    files = sorted(f for f in os.listdir(td) if f.startswith("file"))
     if not files:
         raise RuntimeError("no output file")
     return [os.path.join(td, f) for f in files], []
