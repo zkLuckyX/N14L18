@@ -211,6 +211,7 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
     if wait:
         await update.message.reply_text(f"bhai thoda ruk, {wait}s me dobara bhej")
         return
+    log.info("JOB start uid=%s url=%s mp3=%s subs=%s fmt=%s", uid, url[:60], mp3, subs, force_fmt)
     status = await update.message.reply_text(
         "subtitles nikal raha hoon..." if subs else
         "audio nikal raha hoon..." if mp3 else "download start...")
@@ -247,15 +248,18 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
         for fmt in chain:
             td = tempfile.mkdtemp()
             try:
+                log.info("JOB downloading uid=%s fmt=%s", uid, fmt[:40])
                 path, _ = await loop.run_in_executor(ctx.bot_data["pool"],
                     lambda f=fmt: run_ytdlp(url, td, f, mp3, extra=trim))
                 size = os.path.getsize(path)
+                log.info("JOB downloaded uid=%s size=%.1fMB", uid, size/1048576)
 
                 if size > MAX_BYTES:
                     await safe_edit(status, "video badi hai, hisso me tod raha hoon (quality same rahegi)...")
                     parts = await loop.run_in_executor(ctx.bot_data["pool"], lambda: split_video(path, td))
                     ok_parts = [p for p in parts if os.path.getsize(p) <= MAX_BYTES]
                     if ok_parts:
+                        log.info("JOB split uid=%s parts=%s", uid, len(ok_parts))
                         for i, p in enumerate(ok_parts, 1):
                             await send_video(update, ctx, p, td, caption=f"part {i}/{len(ok_parts)}")
                         bump_stats(uid, "video", size)
@@ -266,6 +270,7 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
                     continue
 
                 await safe_edit(status, "upload kar raha hoon...")
+                log.info("JOB uploading uid=%s size=%.1fMB", uid, size/1048576)
                 await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
                 if mp3:
                     with open(path, "rb") as f:
@@ -274,6 +279,7 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
                 else:
                     await send_video(update, ctx, path, td)
                 bump_stats(uid, "audio" if mp3 else "video", size)
+                log.info("JOB DONE uid=%s", uid)
                 await cleanup(status, update)
                 return
             except subprocess.TimeoutExpired:
@@ -284,6 +290,7 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
                 log.error("try %s fail: %s", fmt, last_err)
             finally:
                 shutil.rmtree(td, ignore_errors=True)
+        log.error("JOB FAILED uid=%s err=%s", uid, last_err)
         await safe_edit(status, "download fail: " + last_err)
     finally:
         pass
@@ -530,7 +537,7 @@ async def debug_yt(update: Update, ctx):
 def main():
     ytdlp_version_check()
     app = Application.builder().token(TOKEN).concurrent_updates(True).build()
-    app.bot_data["pool"] = ThreadPoolExecutor(max_workers=2)
+    app.bot_data["pool"] = ThreadPoolExecutor(max_workers=4)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("audio", handle_audio))
     app.add_handler(CommandHandler("sub", handle_sub))
@@ -541,6 +548,19 @@ def main():
     app.add_handler(CommandHandler("debug", debug_yt))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT, handle_video))
+
+    async def _set_cmds(app_):
+        from telegram import BotCommand
+        await app_.bot.set_my_commands([
+            BotCommand("start", "bot chalu / menu"),
+            BotCommand("q", "quality chuno"),
+            BotCommand("audio", "mp3 nikalo"),
+            BotCommand("sub", "subtitles ke sath"),
+            BotCommand("trim", "hissa download karo"),
+            BotCommand("playlist", "poori playlist"),
+            BotCommand("stats", "tera score"),
+        ])
+    app.post_init = _set_cmds
     log.info("bot live")
     app.run_polling()
 
