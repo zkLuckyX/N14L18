@@ -505,6 +505,38 @@ async def handle_stats(update: Update, ctx):
     await update.message.reply_text(
         f"tera score:\n🎥 videos: {s['videos']}\n🎵 audios: {s['audios']}\n📦 total: {s['mb']} MB")
 
+def disk_usage():
+    st = os.statvfs("/tmp")
+    tot = (st.f_blocks * st.f_frsize) / 1048576
+    free = (st.f_bavail * st.f_frsize) / 1048576
+    return tot - free, free, tot
+
+async def handle_disk(update: Update, ctx):
+    used, free, tot = await asyncio.get_running_loop().run_in_executor(
+        getattr(ctx, "bot_data", {}).get("pool") or __import__("concurrent.futures", fromlist=["x"]).ThreadPoolExecutor(),
+        disk_usage)
+    await update.message.reply_text(
+        f"💾 server ka disk:\nused: {used:.0f} MB\nfree: {free:.0f} MB\ntotal: {tot:.0f} MB")
+
+async def tmp_cleaner(app):
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            now = time.time()
+            for f in os.listdir("/tmp"):
+                p = os.path.join("/tmp", f)
+                old_ = now - os.path.getmtime(p) > 3600
+                if not old_:
+                    continue
+                if os.path.isfile(p) and (f.startswith("file") or f.endswith((".mp4",".mp3"))):
+                    os.remove(p)
+                elif os.path.isdir(p) and f.startswith("dl_"):
+                    import shutil as _sh
+                    _sh.rmtree(p, ignore_errors=True)
+            log.info("tmp cleaned")
+        except Exception as e:
+            log.error("tmp clean fail: %s", e)
+
 async def handle_history(update: Update, ctx):
     h = get_history(update.effective_user.id)
     if not h:
@@ -706,6 +738,7 @@ def main():
     app.add_handler(CommandHandler("stats", handle_stats))
     app.add_handler(CommandHandler("q", qmenu_cb))
     app.add_handler(CommandHandler("history", handle_history))
+    app.add_handler(CommandHandler("disk", handle_disk))
     app.add_handler(CommandHandler("again", handle_again))
     app.add_handler(CommandHandler("debug", debug_yt))
     app.add_handler(CallbackQueryHandler(on_button))
@@ -722,7 +755,10 @@ def main():
             BotCommand("playlist", "poori playlist"),
             BotCommand("stats", "tera score"),
         ])
-    app.post_init = _set_cmds
+    async def _post(app_):
+        await _set_cmds(app_)
+        app_.create_task(tmp_cleaner(app_))
+    app.post_init = _post
     log.info("bot live")
     app.run_polling()
 
