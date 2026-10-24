@@ -191,8 +191,7 @@ def full_meta(url, td):
         cmd = ["yt-dlp", "-J", "--no-playlist", "--no-warnings", "--skip-download"] + cookie_args(td) + [url]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=BASE_ENV)
         info = json.loads(r.stdout)
-        cap = (info.get("title", "") + ("\n" + info["description"] if info.get("description") else "")).strip()
-        return cap[:900] or None
+        return (info.get("title", "").strip()[:200] or None)
     except Exception:
         return None
 
