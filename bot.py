@@ -754,6 +754,9 @@ def main():
             BotCommand("trim", "hissa download karo"),
             BotCommand("playlist", "poori playlist"),
             BotCommand("stats", "tera score"),
+            BotCommand("history", "pichle 5 links"),
+            BotCommand("again", "history se dobara download"),
+            BotCommand("disk", "server ka space"),
         ])
     async def _post(app_):
         await _set_cmds(app_)
