@@ -90,6 +90,12 @@ def ytdlp_version_check():
     v = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True)
     log.info("yt-dlp %s", v.stdout.strip())
 
+async def safe_edit(msg, text):
+    try:
+        await msg.edit_text(text)
+    except Exception:
+        pass
+
 async def download_job(update, ctx, url, mp3=False):
     chat_id = update.effective_chat.id
     status = await update.message.reply_text("download start..." if not mp3 else "audio nikal raha hoon...")
@@ -105,11 +111,11 @@ async def download_job(update, ctx, url, mp3=False):
             if size > MAX_BYTES:
                 last_err = "50MB+ video: chhoti quality try kar raha hoon..."
                 try:
-                    await status.edit_text(last_err)
+                    await safe_edit(status, last_err)
                 except Exception:
                     pass
                 continue
-            await status.edit_text("upload kar raha hoon...")
+            await safe_edit(status, "upload kar raha hoon...")
             await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO if not mp3 else ChatAction.UPLOAD_VOICE)
             thumb = None
             dur = wid = hei = None
@@ -151,7 +157,7 @@ async def download_job(update, ctx, url, mp3=False):
             log.error("try %s fail: %s", fmt, last_err)
         finally:
             shutil.rmtree(td, ignore_errors=True)
-    await status.edit_text("download fail: " + last_err)
+    await safe_edit(status, "download fail: " + last_err)
 
 async def handle_video(update: Update, ctx):
     if update.message.text.startswith("/"):
