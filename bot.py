@@ -139,6 +139,19 @@ def run_ytdlp(url, td, fmt, mp3=False, subs=False, extra=None):
         raise RuntimeError("no output file")
     return os.path.join(td, sorted(files)[0]), []
 
+def audio_meta(url, td):
+    try:
+        cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "--print", "%(title)s|||%(uploader)s",
+               "--skip-download"] + cookie_args(td) + [url]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=BASE_ENV)
+        line = (r.stdout or "").strip().splitlines()[-1] if (r.stdout or "").strip() else ""
+        if "|||" in line:
+            t, u = line.split("|||", 1)
+            return t[:60] or "audio", (u[:40] or None)
+    except Exception:
+        pass
+    return "audio", None
+
 def probe(path):
     try:
         pr = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -289,9 +302,13 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
                 log.info("JOB uploading uid=%s size=%.1fMB", uid, size/1048576)
                 await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
                 if mp3:
+                    atitle, aperf = await loop.run_in_executor(ctx.bot_data["pool"],
+                        lambda: audio_meta(url, td))
                     with open(path, "rb") as f:
                         adata = f.read()
-                    await msg.reply_audio(adata, thumbnail=make_thumb(path, td),
+                    await msg.reply_audio(adata, title=atitle, performer=aperf,
+                                          thumbnail=make_thumb(path, td),
+                                          filename=atitle + ".mp3",
                                           read_timeout=600, write_timeout=600)
                 else:
                     await send_video(update, ctx, path, td)
