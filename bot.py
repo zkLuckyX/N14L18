@@ -471,7 +471,7 @@ async def handle_trim(update: Update, ctx):
         ss, to = secs(parts[-2]), secs(parts[-1])
         if ss >= to or to - ss > 600:
             raise ValueError
-        await download_job(update, ctx, url, trim=["--download-sections", f"*{ss}-{to}"])
+        await download_job(update, ctx, url, trim=["--download-sections", f"*{ss}-{to}", "--force-keyframes-at-cuts", "-N", "1", "--concurrent-fragments", "1"])
     except Exception:
         await update.message.reply_text("time samajh nahi aaya. jaise: /trim <url> 0:00 1:00 (max 10 min)")
 
