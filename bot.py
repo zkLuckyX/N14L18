@@ -338,8 +338,9 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
                 prog = {}
                 stop_bar = asyncio.Event()
                 async def bar():
+                    await asyncio.sleep(2)   # jaldi dikhana shuru
                     while not stop_bar.is_set():
-                        await asyncio.sleep(6)
+                        await asyncio.sleep(3)
                         if prog.get("pct"):
                             n = int(str(prog["pct"]).replace("%","").strip() or 0)
                             filled = n // 10
