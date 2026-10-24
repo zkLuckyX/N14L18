@@ -138,9 +138,9 @@ async def download_job(update, ctx, url, mp3=False):
                 pass
             with open(path, "rb") as f:
                 if mp3:
-                    await update.message.reply_audio(f, thumb=thumb, read_timeout=300, write_timeout=300, connect_timeout=300)
+                    await update.message.reply_audio(f, thumbnail=thumb, read_timeout=300, write_timeout=300, connect_timeout=300)
                 else:
-                    await update.message.reply_video(f, caption=None, thumb=thumb, duration=dur,
+                    await update.message.reply_video(f, caption=None, thumbnail=thumb, duration=dur,
                                                      width=wid, height=hei, supports_streaming=True,
                                                      read_timeout=300, write_timeout=300, connect_timeout=300)
             await status.delete()
