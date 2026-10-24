@@ -59,7 +59,7 @@ def run_ytdlp(url, td, fmt, mp3=False):
     r = subprocess.run(cmd, capture_output=True, timeout=900, env=env)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or b"").decode(errors="ignore").strip())
-    files = os.listdir(td)
+    files = [f for f in os.listdir(td) if f.startswith("file.")]
     if not files:
         raise RuntimeError("no output file")
     return os.path.join(td, files[0])
