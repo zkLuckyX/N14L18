@@ -212,12 +212,9 @@ async def safe_edit(msg, text):
         pass
 
 async def cleanup(status, update):
+    delete_later(status)
     try:
-        await status.delete()
-    except Exception:
-        pass
-    try:
-        await update.message.delete()
+        delete_later(update.effective_message)
     except Exception:
         pass
 
@@ -300,9 +297,9 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
                     await send_video(update, ctx, path, td)
                 bump_stats(uid, "audio" if mp3 else "video", size)
                 log.info("JOB DONE uid=%s", uid)
-                delete_later(status)          # status 10 min baad khud gayab
+                delete_later(status)          # sab text 10 min baad gayab
                 try:
-                    await update.effective_message.delete()
+                    delete_later(update.effective_message)
                 except Exception:
                     pass
                 return
@@ -495,14 +492,12 @@ async def youtube_menu(update, ctx, url):
         pass
     try:
         if meta["thumb"]:
-            m = await update.message.reply_photo(meta["thumb"], caption=cap, parse_mode="HTML",
+            await update.message.reply_photo(meta["thumb"], caption=cap, parse_mode="HTML",
                                              reply_markup=InlineKeyboardMarkup(kb_rows))
-            delete_later(m)
             return
     except Exception:
         pass
-    m2 = await update.message.reply_text(cap, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb_rows))
-    delete_later(m2)
+    await update.message.reply_text(cap, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb_rows))
 
 def first_url(text):
     m = URL_RE.search(text or "")
