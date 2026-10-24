@@ -189,6 +189,19 @@ async def send_video(update, ctx, path, td, caption=None):
                                                       width=wid, height=hei, supports_streaming=True,
                                                       read_timeout=600, write_timeout=600, connect_timeout=300)
 
+async def _delete_after(msg, delay=600):
+    try:
+        await asyncio.sleep(delay)
+        await msg.delete()
+    except Exception:
+        pass
+
+def delete_later(msg, delay=600):
+    try:
+        asyncio.get_running_loop().create_task(_delete_after(msg, delay))
+    except Exception:
+        pass
+
 async def safe_edit(msg, text):
     try:
         await msg.edit_text(text)
@@ -284,7 +297,11 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
                     await send_video(update, ctx, path, td)
                 bump_stats(uid, "audio" if mp3 else "video", size)
                 log.info("JOB DONE uid=%s", uid)
-                await cleanup(status, update)
+                delete_later(status)          # status 10 min baad khud gayab
+                try:
+                    await update.effective_message.delete()
+                except Exception:
+                    pass
                 return
             except subprocess.TimeoutExpired:
                 last_err = "time out, video bahut badi/lambi hai"
@@ -296,6 +313,7 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
                 shutil.rmtree(td, ignore_errors=True)
         log.error("JOB FAILED uid=%s err=%s", uid, last_err)
         await safe_edit(status, "download fail: " + last_err)
+        delete_later(status)
     finally:
         pass
 
@@ -473,12 +491,14 @@ async def youtube_menu(update, ctx, url):
         pass
     try:
         if meta["thumb"]:
-            await update.message.reply_photo(meta["thumb"], caption=cap, parse_mode="HTML",
+            m = await update.message.reply_photo(meta["thumb"], caption=cap, parse_mode="HTML",
                                              reply_markup=InlineKeyboardMarkup(kb_rows))
+            delete_later(m)
             return
     except Exception:
         pass
-    await update.message.reply_text(cap, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb_rows))
+    m2 = await update.message.reply_text(cap, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb_rows))
+    delete_later(m2)
 
 def first_url(text):
     m = URL_RE.search(text or "")
