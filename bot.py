@@ -41,7 +41,8 @@ def run_ytdlp(url, td, fmt, mp3=False):
         with open(cf, "w") as fh:
             fh.write(cookie_env.replace("\\n", "\n"))
         cookie_args = ["--cookies", cf]
-    cmd = ["yt-dlp"] + cookie_args + ["-o", out, "--no-playlist", "-N", "16",
+    cmd = ["yt-dlp"] + cookie_args + ["-o", out, "--no-playlist",
+           "--remote-components", "ejs:github", "-N", "16",
            "--retries", "5", "--fragment-retries", "5",
            "--file-access-retries", "5", "--concurrent-fragments", "8",
            "--no-warnings", "--socket-timeout", "20",
@@ -177,7 +178,7 @@ async def debug_yt(update: Update, ctx):
         if cookie_env:
             cf = os.path.join(td, "c.txt")
             open(cf, "w").write(cookie_env.replace("\\n", "\n"))
-        cmd = ["yt-dlp", "-F", "--no-playlist", "--verbose"]
+        cmd = ["yt-dlp", "-F", "--no-playlist", "--verbose", "--remote-components", "ejs:github"]
         if cf:
             cmd += ["--cookies", cf]
         cmd.append(url)
