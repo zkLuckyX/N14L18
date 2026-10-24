@@ -23,7 +23,7 @@ YO = "yo! kisi bhi platform ka video/reel link bhejo (instagram, youtube, tiktok
 URL_RE = re.compile(r"https?://\S+", re.I)
 
 # format fallback chain: try best quality combos, then any best single file
-FORMAT_CHAIN = ["default", "b", "best"]
+FORMAT_CHAIN = ["default", "bv*+ba/b", "best", "worst"]
 
 def first_url(text):
     m = URL_RE.search(text or "")
@@ -34,9 +34,11 @@ async def start(update: Update, ctx):
 
 def run_ytdlp(url, td, fmt, mp3=False):
     out = os.path.join(td, "file.%(ext)s")
-    cmd = ["yt-dlp", "-o", out, "--no-playlist", "-N", "8",
-           "--retries", "3", "--fragment-retries", "3",
-           "--no-warnings", "--socket-timeout", "20", url]
+    cmd = ["yt-dlp", "-o", out, "--no-playlist", "-N", "16",
+           "--retries", "5", "--fragment-retries", "5",
+           "--file-access-retries", "5", "--concurrent-fragments", "8",
+           "--no-warnings", "--socket-timeout", "20",
+           "--extractor-args", "youtube:player_client=android_vr,tv", url]
     if mp3:
         cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
     else:
@@ -68,8 +70,12 @@ async def download_job(update, ctx, url, mp3=False):
                 lambda f=fmt: run_ytdlp(url, td, f, mp3))
             size = os.path.getsize(path)
             if size > MAX_BYTES:
-                await status.edit_text("video 50MB se badi hai (bot limit hai telegram ki). youtube ke liye /audio try kar ya chhoti quality chalegi")
-                return
+                last_err = "50MB+ video: chhoti quality try kar raha hoon..."
+                try:
+                    await status.edit_text(last_err)
+                except Exception:
+                    pass
+                continue
             await status.edit_text("upload kar raha hoon...")
             await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO if not mp3 else ChatAction.UPLOAD_VOICE)
             with open(path, "rb") as f:
