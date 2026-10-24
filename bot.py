@@ -64,13 +64,25 @@ def ytdlp_version_check():
     # khud ko latest rakho: purane version hi aadhe errors ki jad hai
     subprocess.run(["pip", "install", "-q", "-U", "yt-dlp"], capture_output=True, timeout=120)
     if not shutil.which("deno"):
-        try:
-            subprocess.run("curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -y",
-                           shell=True, capture_output=True, timeout=180)
-            os.environ["PATH"] = "/usr/local/bin:" + os.environ.get("PATH", "")
-            subprocess.run(["deno", "--version"], capture_output=True, timeout=10)
-        except Exception as e:
-            log.warning("deno install fail: %s", e)
+        import stat as _stat
+        for dest in ("/opt/render/project/src/.deno/bin", os.path.expanduser("~/.deno/bin"), "/tmp/deno-bin"):
+            try:
+                os.makedirs(dest, exist_ok=True)
+                dl = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip"
+                zp = os.path.join(dest, "deno.zip")
+                r = subprocess.run(["curl", "-fsSL", dl, "-o", zp], capture_output=True, timeout=300)
+                if r.returncode != 0:
+                    log.warning("deno download fail: %s", (r.stderr or b"").decode(errors="ignore")[-150:])
+                    continue
+                subprocess.run(["unzip", "-o", zp, "-d", dest], capture_output=True, timeout=60)
+                os.chmod(os.path.join(dest, "deno"), 0o755)
+                os.environ["PATH"] = dest + ":" + os.environ.get("PATH", "")
+                v = subprocess.run([os.path.join(dest, "deno"), "--version"], capture_output=True, text=True, timeout=10)
+                if v.returncode == 0:
+                    log.info("deno ready: %s", v.stdout.strip().splitlines()[0])
+                    break
+            except Exception as e:
+                log.warning("deno install fail at %s: %s", dest, e)
     v = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True)
     log.info("yt-dlp %s", v.stdout.strip())
 
