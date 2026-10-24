@@ -34,7 +34,14 @@ async def start(update: Update, ctx):
 
 def run_ytdlp(url, td, fmt, mp3=False):
     out = os.path.join(td, "file.%(ext)s")
-    cmd = ["yt-dlp", "-o", out, "--no-playlist", "-N", "16",
+    cookie_env = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    cookie_args = []
+    if cookie_env:
+        cf = os.path.join(td, "cookies.txt")
+        with open(cf, "w") as fh:
+            fh.write(cookie_env.replace("\\n", "\n"))
+        cookie_args = ["--cookies", cf]
+    cmd = ["yt-dlp"] + cookie_args + ["-o", out, "--no-playlist", "-N", "16",
            "--retries", "5", "--fragment-retries", "5",
            "--file-access-retries", "5", "--concurrent-fragments", "8",
            "--no-warnings", "--socket-timeout", "20",
@@ -56,6 +63,14 @@ def run_ytdlp(url, td, fmt, mp3=False):
 def ytdlp_version_check():
     # khud ko latest rakho: purane version hi aadhe errors ki jad hai
     subprocess.run(["pip", "install", "-q", "-U", "yt-dlp"], capture_output=True, timeout=120)
+    if not shutil.which("deno"):
+        try:
+            subprocess.run("curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -y",
+                           shell=True, capture_output=True, timeout=180)
+            os.environ["PATH"] = "/usr/local/bin:" + os.environ.get("PATH", "")
+            subprocess.run(["deno", "--version"], capture_output=True, timeout=10)
+        except Exception as e:
+            log.warning("deno install fail: %s", e)
     v = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True)
     log.info("yt-dlp %s", v.stdout.strip())
 
