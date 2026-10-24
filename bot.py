@@ -54,6 +54,8 @@ def run_ytdlp(url, td, fmt, mp3=False):
     return os.path.join(td, files[0])
 
 def ytdlp_version_check():
+    # khud ko latest rakho: purane version hi aadhe errors ki jad hai
+    subprocess.run(["pip", "install", "-q", "-U", "yt-dlp"], capture_output=True, timeout=120)
     v = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True)
     log.info("yt-dlp %s", v.stdout.strip())
 
