@@ -184,7 +184,7 @@ def send_video(update, ctx, path, td, caption=None):
     dur, wid, hei = probe(path)
     thumb = make_thumb(path, td)
     with open(path, "rb") as f:
-        return update.message.reply_video(f, caption=caption, thumbnail=thumb, duration=dur,
+        return update.effective_message.reply_video(f, caption=caption, thumbnail=thumb, duration=dur,
                                           width=wid, height=hei, supports_streaming=True,
                                           read_timeout=600, write_timeout=600, connect_timeout=300)
 
@@ -207,15 +207,17 @@ async def cleanup(status, update):
 # ---------- main download pipeline ----------
 async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force_fmt=None):
     uid = update.effective_user.id
+    msg = update.effective_message      # button se aaye to bhi chalega
+    chat_id = update.effective_chat.id
     wait = rate_ok(uid)
     if wait:
-        await update.message.reply_text(f"bhai thoda ruk, {wait}s me dobara bhej")
+        await msg.reply_text(f"bhai thoda ruk, {wait}s me dobara bhej")
         return
     log.info("JOB start uid=%s url=%s mp3=%s subs=%s fmt=%s", uid, url[:60], mp3, subs, force_fmt)
-    status = await update.message.reply_text(
+    status = await msg.reply_text(
         "subtitles nikal raha hoon..." if subs else
         "audio nikal raha hoon..." if mp3 else "download start...")
-    await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    await ctx.bot.send_chat_action(chat_id, ChatAction.TYPING)
     loop = asyncio.get_running_loop()
 
     try:  # subtitles path
@@ -225,7 +227,7 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
             if sub_files:
                 for sf in sub_files[:4]:
                     with open(sf, "rb") as fh:
-                        await update.message.reply_document(fh)
+                        await msg.reply_document(fh)
                 await cleanup(status, update)
             else:
                 await safe_edit(status, "is video ki koi subtitle nahi mili")
@@ -271,10 +273,10 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
 
                 await safe_edit(status, "upload kar raha hoon...")
                 log.info("JOB uploading uid=%s size=%.1fMB", uid, size/1048576)
-                await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
+                await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
                 if mp3:
                     with open(path, "rb") as f:
-                        await update.message.reply_audio(f, thumbnail=make_thumb(path, td),
+                        await msg.reply_audio(f, thumbnail=make_thumb(path, td),
                                                          read_timeout=600, write_timeout=600)
                 else:
                     await send_video(update, ctx, path, td)
