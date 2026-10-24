@@ -111,11 +111,32 @@ async def download_job(update, ctx, url, mp3=False):
                 continue
             await status.edit_text("upload kar raha hoon...")
             await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO if not mp3 else ChatAction.UPLOAD_VOICE)
+            thumb = None
+            dur = wid = hei = None
+            try:
+                pr = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                                     "-show_entries", "stream=width,height:format=duration",
+                                     "-of", "json", path], capture_output=True, text=True, timeout=30)
+                import json as _json
+                info = _json.loads(pr.stdout or "{}")
+                dur = int(float(info.get("format", {}).get("duration", 0))) or None
+                st = (info.get("streams") or [{}])[0]
+                wid, hei = st.get("width"), st.get("height")
+                thumb = os.path.join(td, "thumb.jpg")
+                subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", "1", "-i", path,
+                                "-vframes", "1", "-vf", "scale=320:-2", thumb],
+                               capture_output=True, timeout=60)
+                if not os.path.exists(thumb):
+                    thumb = None
+            except Exception:
+                pass
             with open(path, "rb") as f:
                 if mp3:
-                    await update.message.reply_audio(f, read_timeout=300, write_timeout=300, connect_timeout=300)
+                    await update.message.reply_audio(f, thumb=thumb, read_timeout=300, write_timeout=300, connect_timeout=300)
                 else:
-                    await update.message.reply_video(f, caption=None, read_timeout=300, write_timeout=300, connect_timeout=300)
+                    await update.message.reply_video(f, caption=None, thumb=thumb, duration=dur,
+                                                     width=wid, height=hei, supports_streaming=True,
+                                                     read_timeout=300, write_timeout=300, connect_timeout=300)
             await status.delete()
             try:
                 await update.message.delete()
