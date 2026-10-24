@@ -26,7 +26,7 @@ COOLDOWN = 20  # seconds between downloads per user
 YO = ("yo! kisi bhi platform ka video/reel link bhejo (instagram, youtube, tiktok, "
       "twitter/x, facebook, pinterest, reddit...), best quality me dunga\n\n"
       "commands:\n/audio <url> - sirf mp3\n/sub <url> - subtitles ke sath\n"
-      "/trim <url> <start> <end> - jaise /trim <url> 0:00 1:00\n"
+
       "/playlist <url> - poori playlist (max 10)\n/q - quality chuno (1080/720/480/360)\n"
       "/stats - teri downloads\n/auto - auto quality wapas")
 
@@ -288,16 +288,7 @@ async def cleanup(status, update):
         pass
 
 # ---------- main download pipeline ----------
-def exact_cut(path, td, ss, to):
-    out = os.path.join(td, "cut.mp4")
-    subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", str(ss), "-to", str(to), "-i", path,
-                    "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", out],
-                   timeout=600, env=BASE_ENV)
-    if not os.path.exists(out) or os.path.getsize(out) < 10000:
-        raise RuntimeError("trim cut fail")
-    return out
-
-async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force_fmt=None, trim_cut=None):
+async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force_fmt=None, ):
     uid = update.effective_user.id
     msg = update.effective_message      # button se aaye to bhi chalega
     chat_id = update.effective_chat.id
@@ -389,19 +380,6 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
                     await cleanup(status, update)
                     return
                 path = paths[0]
-                if trim_cut:
-                    await safe_edit(status, "exact cut banata hoon, 1 min do...")
-                    path = await loop.run_in_executor(ctx.bot_data["pool"],
-                        lambda: exact_cut(path, td, trim_cut[0], trim_cut[1]))
-                    await send_video(update, ctx, path, td)
-                    bump_stats(uid, "video", os.path.getsize(path))
-                    log.info("JOB DONE uid=%s (trim exact)", uid)
-                    delete_later(status)
-                    try:
-                        delete_later(update.effective_message)
-                    except Exception:
-                        pass
-                    return
                 size = os.path.getsize(path)
                 if size > MAX_BYTES:
                     await safe_edit(status, "video badi hai, hisso me tod raha hoon (quality same rahegi)...")
@@ -477,27 +455,6 @@ async def handle_sub(update: Update, ctx):
         await update.message.reply_text("link bhejo jaise: /sub <url>")
         return
     await download_job(update, ctx, url, subs=True)
-
-async def handle_trim(update: Update, ctx):
-    parts = update.message.text.split()
-    url = first_url(update.message.text)
-    if len(parts) < 3 or not url:
-        await update.message.reply_text("aise bhej: /trim <url> 0:00 1:00")
-        return
-    try:
-        def secs(s):
-            if ":" in s:
-                p = [int(x) for x in s.split(":")]
-                return sum(v * 60 ** i for i, v in enumerate(reversed(p)))
-            return int(s)
-        ss, to = secs(parts[-2]), secs(parts[-1])
-        if ss >= to or to - ss > 600:
-            raise ValueError
-        lo, hi = max(ss - 5, 0), to + 5
-        args = ["--download-sections", f"*{lo}-{hi}", "-N", "16", "--concurrent-fragments", "8"]
-        await download_job(update, ctx, url, trim=args, trim_cut=(ss, to))
-    except Exception:
-        await update.message.reply_text("time samajh nahi aaya. jaise: /trim <url> 0:00 1:00 (max 10 min)")
 
 async def handle_playlist(update: Update, ctx):
     url = first_url(update.message.text)
@@ -757,7 +714,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("audio", handle_audio))
     app.add_handler(CommandHandler("sub", handle_sub))
-    app.add_handler(CommandHandler("trim", handle_trim))
     app.add_handler(CommandHandler("playlist", handle_playlist))
     app.add_handler(CommandHandler("stats", handle_stats))
     app.add_handler(CommandHandler("q", qmenu_cb))
@@ -775,7 +731,6 @@ def main():
             BotCommand("q", "quality chuno"),
             BotCommand("audio", "mp3 nikalo"),
             BotCommand("sub", "subtitles ke sath"),
-            BotCommand("trim", "hissa download karo"),
             BotCommand("playlist", "poori playlist"),
             BotCommand("stats", "tera score"),
             BotCommand("history", "pichle 5 links"),
