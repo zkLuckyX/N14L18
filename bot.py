@@ -180,13 +180,14 @@ def split_video(path, td):
         pass
     return parts
 
-def send_video(update, ctx, path, td, caption=None):
+async def send_video(update, ctx, path, td, caption=None):
     dur, wid, hei = probe(path)
     thumb = make_thumb(path, td)
     with open(path, "rb") as f:
-        return update.effective_message.reply_video(f, caption=caption, thumbnail=thumb, duration=dur,
-                                          width=wid, height=hei, supports_streaming=True,
-                                          read_timeout=600, write_timeout=600, connect_timeout=300)
+        data = f.read()   # bytes me padh lo, file band hone ka issue nahi
+    return await update.effective_message.reply_video(data, caption=caption, thumbnail=thumb, duration=dur,
+                                                      width=wid, height=hei, supports_streaming=True,
+                                                      read_timeout=600, write_timeout=600, connect_timeout=300)
 
 async def safe_edit(msg, text):
     try:
@@ -276,8 +277,9 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
                 await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
                 if mp3:
                     with open(path, "rb") as f:
-                        await msg.reply_audio(f, thumbnail=make_thumb(path, td),
-                                                         read_timeout=600, write_timeout=600)
+                        adata = f.read()
+                    await msg.reply_audio(adata, thumbnail=make_thumb(path, td),
+                                          read_timeout=600, write_timeout=600)
                 else:
                     await send_video(update, ctx, path, td)
                 bump_stats(uid, "audio" if mp3 else "video", size)
