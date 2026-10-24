@@ -52,7 +52,10 @@ def run_ytdlp(url, td, fmt, mp3=False):
         if fmt != "default":
             cmd += ["-f", fmt]
         cmd += ["--merge-output-format", "mp4", "--max-filesize", "49M"]
-    r = subprocess.run(cmd, capture_output=True, timeout=900)
+    env = dict(os.environ)
+    env.setdefault("DENO_DIR", "/tmp/deno")
+    env.setdefault("XDG_CACHE_HOME", "/tmp/xdg")
+    r = subprocess.run(cmd, capture_output=True, timeout=900, env=env)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or b"").decode(errors="ignore").strip())
     files = os.listdir(td)
