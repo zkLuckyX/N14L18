@@ -55,6 +55,25 @@ def rate_ok(uid):
     _last_dl[uid] = now
     return 0
 
+# ---------- history ----------
+HISTORY_FILE = "/tmp/dlbot_history.json"
+def add_history(uid, url):
+    try:
+        h = json.load(open(HISTORY_FILE))
+    except Exception:
+        h = {}
+    lst = h.get(str(uid), [])
+    if url not in lst:
+        lst.insert(0, url)
+        h[str(uid)] = lst[:5]
+        json.dump(h, open(HISTORY_FILE, "w"))
+
+def get_history(uid):
+    try:
+        return json.load(open(HISTORY_FILE)).get(str(uid), [])
+    except Exception:
+        return []
+
 # ---------- user quality pref (in-memory) ----------
 user_quality = {}   # uid -> int or None (auto)
 pending = {}        # uid -> {"url":..., "opts":[(label, fmt), ...]} youtube menu ke liye
@@ -111,12 +130,21 @@ BASE_ENV = dict(os.environ)
 BASE_ENV.setdefault("DENO_DIR", "/tmp/deno")
 BASE_ENV.setdefault("XDG_CACHE_HOME", "/tmp/xdg")
 
-def run_ytdlp(url, td, fmt, mp3=False, subs=False, extra=None):
-    out = os.path.join(td, "file.%(ext)s")
+def run_ytdlp(url, td, fmt, mp3=False, subs=False, extra=None, prog=None):
+    insta = "instagram.com" in url
+    if insta:
+        out = os.path.join(td, "file%(playlist_index)03d.%(ext)s")
+    else:
+        out = os.path.join(td, "file.%(ext)s")
     cmd = ["yt-dlp"] + cookie_args(td) + ["-o", out, "--remote-components", "ejs:github",
            "-N", "16", "--retries", "5", "--fragment-retries", "5",
            "--file-access-retries", "5", "--concurrent-fragments", "8",
            "--no-warnings", "--socket-timeout", "20"]
+    if insta:
+        cmd += ["--yes-playlist"]   # story/carousel: sab media ek sath
+    if prog is not None:
+        cmd += ["--newline", "--progress-template",
+                "P|%(progress._percent_str)s|%(progress._speed_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s"]
     if subs:
         cmd += ["--write-subs", "--write-auto-subs", "--sub-langs", "en,hi",
                 "--convert-subs", "srt", "--skip-download"]
@@ -131,13 +159,42 @@ def run_ytdlp(url, td, fmt, mp3=False, subs=False, extra=None):
         if fmt != "default":
             cmd += ["-f", fmt]
         cmd += ["--merge-output-format", "mp4"]
-    r = subprocess.run(cmd + [url], capture_output=True, timeout=900, env=BASE_ENV)
+    r = subprocess.Popen(cmd + [url], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=BASE_ENV, bufsize=1)
+    err_tail = []
+    import threading as _t
+    def _drain():
+        tail = (r.stderr.read() or "")
+        err_tail.append(tail)
+    _t.Thread(target=_drain, daemon=True).start()
+    for line in r.stdout:
+        line = line.strip()
+        if prog is not None and line.startswith("P|"):
+            p = line.split("|")
+            try:
+                prog["pct"] = p[1].strip()
+                prog["spd"] = p[2].strip()
+                prog["done"] = int(float(p[3] or 0))
+                prog["tot"] = int(float(p[4] or 0))
+            except Exception:
+                pass
+    r.wait()
     if r.returncode != 0:
-        raise RuntimeError((r.stderr or b"").decode(errors="ignore").strip()[-300:])
-    files = [f for f in os.listdir(td) if f.startswith("file.")]
+        raise RuntimeError((err_tail[0] if err_tail else "").strip()[-300:])
+    files = sorted(f for f in os.listdir(td) if f.startswith("file."))
     if not files:
         raise RuntimeError("no output file")
-    return os.path.join(td, sorted(files)[0]), []
+    return [os.path.join(td, f) for f in files], []
+
+def full_meta(url, td):
+    try:
+        cmd = ["yt-dlp", "-J", "--no-playlist", "--no-warnings", "--skip-download"] + cookie_args(td) + [url]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=BASE_ENV)
+        info = json.loads(r.stdout)
+        cap = (info.get("title", "") + ("\n" + info["description"] if info.get("description") else "")).strip()
+        return cap[:900] or None
+    except Exception:
+        return None
 
 def audio_meta(url, td):
     try:
@@ -241,6 +298,7 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
         await msg.reply_text(f"bhai thoda ruk, {wait}s me dobara bhej")
         return
     log.info("JOB start uid=%s url=%s mp3=%s subs=%s fmt=%s", uid, url[:60], mp3, subs, force_fmt)
+    add_history(uid, url)
     status = await msg.reply_text(
         "subtitles nikal raha hoon..." if subs else
         "audio nikal raha hoon..." if mp3 else "download start...")
@@ -278,11 +336,51 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
             td = tempfile.mkdtemp()
             try:
                 log.info("JOB downloading uid=%s fmt=%s", uid, fmt[:40])
-                path, _ = await loop.run_in_executor(ctx.bot_data["pool"],
-                    lambda f=fmt: run_ytdlp(url, td, f, mp3, extra=trim))
-                size = os.path.getsize(path)
-                log.info("JOB downloaded uid=%s size=%.1fMB", uid, size/1048576)
+                prog = {}
+                stop_bar = asyncio.Event()
+                async def bar():
+                    while not stop_bar.is_set():
+                        await asyncio.sleep(6)
+                        if prog.get("pct"):
+                            n = int(str(prog["pct"]).replace("%","").strip() or 0)
+                            filled = n // 10
+                            txt = ("⬇️ " + "█"*filled + "░"*(10-filled) + " " + str(prog["pct"]).strip()
+                                   + "  " + str(prog.get("spd","")).strip())
+                            try:
+                                await safe_edit(status, txt)
+                            except Exception:
+                                pass
+                bar_task = asyncio.create_task(bar())
+                try:
+                    paths, _ = await loop.run_in_executor(ctx.bot_data["pool"],
+                        lambda f=fmt: run_ytdlp(url, td, f, mp3, extra=trim, prog=prog))
+                finally:
+                    stop_bar.set()
+                    try:
+                        await bar_task
+                    except Exception:
+                        pass
+                total = sum(os.path.getsize(p) for p in paths)
+                log.info("JOB downloaded uid=%s files=%s size=%.1fMB", uid, len(paths), total/1048576)
 
+                if len(paths) > 1:   # insta carousel/story: sab files
+                    ok_files = [p for p in paths if os.path.getsize(p) <= MAX_BYTES]
+                    log.info("JOB carousel uid=%s files=%s", uid, len(ok_files))
+                    for i, p in enumerate(ok_files, 1):
+                        try:
+                            await send_video(update, ctx, p, td)
+                        except Exception:
+                            try:
+                                with open(p, "rb") as fh:
+                                    await msg.reply_photo(fh)
+                            except Exception as e2:
+                                log.error("carousel item fail: %s", e2)
+                    bump_stats(uid, "video", total)
+                    log.info("JOB DONE uid=%s", uid)
+                    await cleanup(status, update)
+                    return
+                path = paths[0]
+                size = os.path.getsize(path)
                 if size > MAX_BYTES:
                     await safe_edit(status, "video badi hai, hisso me tod raha hoon (quality same rahegi)...")
                     parts = await loop.run_in_executor(ctx.bot_data["pool"], lambda: split_video(path, td))
@@ -311,7 +409,9 @@ async def download_job(update, ctx, url, mp3=False, subs=False, trim=None, force
                                           filename=atitle + ".mp3",
                                           read_timeout=600, write_timeout=600)
                 else:
-                    await send_video(update, ctx, path, td)
+                    cap = await loop.run_in_executor(ctx.bot_data["pool"],
+                        lambda: full_meta(url, td))
+                    await send_video(update, ctx, path, td, caption=cap)
                 bump_stats(uid, "audio" if mp3 else "video", size)
                 log.info("JOB DONE uid=%s", uid)
                 delete_later(status)          # sab text 10 min baad gayab
@@ -404,6 +504,23 @@ async def handle_stats(update: Update, ctx):
     s = load_stats().get(str(update.effective_user.id), {"videos": 0, "audios": 0, "mb": 0})
     await update.message.reply_text(
         f"tera score:\n🎥 videos: {s['videos']}\n🎵 audios: {s['audios']}\n📦 total: {s['mb']} MB")
+
+async def handle_history(update: Update, ctx):
+    h = get_history(update.effective_user.id)
+    if not h:
+        await update.message.reply_text("abhi koi history nahi")
+        return
+    lines = [f"{i+1}. {u[:70]}" for i, u in enumerate(h)]
+    await update.message.reply_text("tere pichle 5 links:\n" + "\n".join(lines) + "\n\ndobara download: /again <number>")
+
+async def handle_again(update: Update, ctx):
+    parts_ = update.message.text.split()
+    h = get_history(update.effective_user.id)
+    if len(parts_) < 2 or not parts_[1].isdigit() or int(parts_[1]) < 1 or int(parts_[1]) > len(h):
+        await update.message.reply_text(f"aise: /again 1 .. /again {max(len(h),1)}")
+        return
+    url = h[int(parts_[1]) - 1]
+    await download_job(update, ctx, url, mp3=False)
 
 async def qmenu_cb(update: Update, ctx):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(h, callback_data=f"setq_{h[:-1]}")
@@ -588,6 +705,8 @@ def main():
     app.add_handler(CommandHandler("playlist", handle_playlist))
     app.add_handler(CommandHandler("stats", handle_stats))
     app.add_handler(CommandHandler("q", qmenu_cb))
+    app.add_handler(CommandHandler("history", handle_history))
+    app.add_handler(CommandHandler("again", handle_again))
     app.add_handler(CommandHandler("debug", debug_yt))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT, handle_video))
