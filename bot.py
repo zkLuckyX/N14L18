@@ -443,14 +443,17 @@ async def on_button(update: Update, ctx):
             user_quality[q.from_user.id] = None
             await q.message.reply_text("download start (auto best)...")
             await download_job(update, ctx, url, mp3=False)
+            delete_later(q.message)   # menu bhi ab 10 min baad gayab
             return
         if fmt == "__MP3__":
             await q.message.reply_text("audio nikal raha hoon...")
             await download_job(update, ctx, url, mp3=True)
+            delete_later(q.message)
             return
         user_quality[q.from_user.id] = None  # ek baar ki choice, default auto hi rahe
         await q.message.reply_text(f"download start ({label})...")
         await download_job(update, ctx, url, mp3=False, force_fmt=fmt)
+        delete_later(q.message)
     elif d.startswith("setq_"):
         v = d.split("_")[1]
         user_quality[q.from_user.id] = None if v == "auto" else int(v)
