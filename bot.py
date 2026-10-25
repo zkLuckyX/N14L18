@@ -1915,7 +1915,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except (IndexError, TypeError):
         await reply_text_auto(context, query.message, "That option is no longer available. Send the link again.")
         return
-    _PENDING.pop(token, None)
+    # Keep this menu reusable until its normal 10-minute expiry. Users may
+    # select another resolution, automatic quality, or MP3 from the same menu.
     if fmt == "__MP3__":
         await download_job(update, context, entry["url"], mp3=True)
     elif fmt == "__AUTO__":
