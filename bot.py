@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from telegram import (
@@ -55,6 +55,8 @@ if not TOKEN:
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MIB", "45")) * 1024 * 1024
 MAX_SOURCE_BYTES = int(os.environ.get("MAX_SOURCE_MIB", "1024")) * 1024 * 1024
 MAX_PLAYLIST = max(1, min(int(os.environ.get("MAX_PLAYLIST", "10")), 20))
+MAX_BATCH_LINKS = max(1, min(int(os.environ.get("MAX_BATCH_LINKS", "10")), 20))
+BOT_VERSION = "v10-sequential-queue"
 USER_COOLDOWN = max(0, int(os.environ.get("USER_COOLDOWN_SECONDS", "15")))
 DOWNLOAD_TIMEOUT = max(90, int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "480")))
 FFMPEG_TIMEOUT = max(60, int(os.environ.get("FFMPEG_TIMEOUT_SECONDS", "240")))
@@ -126,6 +128,7 @@ WELCOME = (
     "/audio URL — download audio as MP3\n"
     "/sub URL — download available English/Hindi subtitles\n"
     "/playlist URL — download up to the configured playlist limit\n"
+    f"Send up to {MAX_BATCH_LINKS} links in one message for sequential downloads.\n"
     "/q — choose a preferred video quality\n"
     "/auto — return to automatic quality selection\n"
     "/stats — view your download statistics\n"
@@ -219,6 +222,50 @@ def first_url(text: str | None) -> str | None:
     if not match:
         return None
     return match.group(0).rstrip(".,!;:)]}")
+
+
+def extract_urls(text: str | None, limit: int | None = None) -> list[str]:
+    """Return distinct HTTP(S) URLs in message order, trimming common punctuation."""
+    cap = limit or MAX_BATCH_LINKS + 1
+    urls: list[str] = []
+    for match in URL_RE.finditer(text or ""):
+        candidate = match.group(0).rstrip(".,!;:)]}")
+        if candidate and candidate not in urls:
+            urls.append(candidate)
+        if len(urls) >= cap:
+            break
+    return urls
+
+
+def _is_youtube_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    return host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+
+
+def _is_youtube_playlist_url(url: str) -> bool:
+    """Identify regular YouTube playlist URLs, including watch URLs carrying list=."""
+    if not _is_youtube_url(url):
+        return False
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    return parsed.path.rstrip("/").lower() == "/playlist" or bool(query.get("list"))
+
+
+def _youtube_video_id(url: str) -> str | None:
+    """Extract a compact YouTube video ID so menu callbacks survive process restarts."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    candidate = ""
+    if host == "youtu.be":
+        candidate = parsed.path.strip("/").split("/", 1)[0]
+    elif host == "youtube.com" or host.endswith(".youtube.com"):
+        query = parse_qs(parsed.query)
+        candidate = (query.get("v") or [""])[0]
+        if not candidate:
+            parts = [part for part in parsed.path.split("/") if part]
+            if len(parts) >= 2 and parts[0].lower() in {"shorts", "embed", "live", "v"}:
+                candidate = parts[1]
+    return candidate if re.fullmatch(r"[A-Za-z0-9_-]{6,20}", candidate or "") else None
 
 
 def validate_url(url: str) -> str:
@@ -377,8 +424,38 @@ def _instagram_url_candidates(url: str) -> list[str]:
 
 
 def _media_template(workdir: str) -> str:
-    # id and autonumber avoid collisions for posts containing multiple media items.
-    return os.path.join(workdir, "media_%(autonumber)03d_%(id)s.%(ext)s")
+    # A bounded title is part of the actual saved filename; ID + sequence prevent collisions.
+    return os.path.join(workdir, "%(title).80B [%(id)s]_%(autonumber)03d.%(ext)s")
+
+
+def _title_from_path(path: str) -> str:
+    """Recover the descriptive title from our output template when metadata tags are absent."""
+    stem = Path(path).stem
+    match = re.match(r"^(.*?)\s+\[[^\]]+\]_\d{3}$", stem)
+    if match and match.group(1).strip():
+        return match.group(1).strip()[:200]
+    legacy = re.sub(r"^media_\d+_", "", stem)
+    return (legacy or stem or "Downloaded media")[:200]
+
+
+
+
+def _safe_filename_title(title: str) -> str:
+    title = re.sub(r'[\x00-\x1f<>:"/\\|?*]+', "_", title)
+    title = re.sub(r"\s+", " ", title).strip(" ._-_")
+    return (title or "Downloaded media")[:120]
+
+
+def _rename_media_file(path: str, filename_stem: str) -> str:
+    """Give normalized/remuxed outputs a stable title-based filename."""
+    source = Path(path)
+    target = source.with_name(f"{filename_stem}{source.suffix.lower()}")
+    if source.resolve() == target.resolve():
+        return str(source)
+    if target.exists():
+        target = source.with_name(f"{filename_stem}_{uuid.uuid4().hex[:6]}{source.suffix.lower()}")
+    os.replace(source, target)
+    return str(target)
 
 
 def _is_instagram_post_url(url: str) -> bool:
@@ -526,7 +603,7 @@ def _download_media(
         "yt-dlp", "--ignore-config", "--no-warnings", "--newline",
         "--retries", "2", "--fragment-retries", "2", "--extractor-retries", "1",
         "--file-access-retries", "2", "--socket-timeout", "15",
-        "--concurrent-fragments", "4", "--trim-filenames", "100",
+        "--concurrent-fragments", "4",
         "--remote-components", "ejs:github",
         "--print", "after_move:filepath",
         "-o", _media_template(workdir),
@@ -549,10 +626,13 @@ def _download_media(
     if subtitles:
         command_base += ["--write-subs", "--write-auto-subs", "--sub-langs", "en,hi",
                          "--convert-subs", "srt", "--skip-download"]
-    elif mp3:
+    else:
+        # Embeds title/uploader metadata where the source container supports it.
+        command_base += ["--embed-metadata"]
+    if mp3:
         command_base += [
             "-x", "--audio-format", "mp3", "--audio-quality", "0",
-            "--parse-metadata", "%(uploader|)s:%(meta_artist)s", "--embed-metadata",
+            "--parse-metadata", "%(uploader|)s:%(meta_artist)s",
         ]
     elif fmt and fmt != "best":
         command_base += ["-f", fmt]
@@ -1168,6 +1248,7 @@ def _prepare_files(paths: list[str], root_dir: str, mp3: bool, progress: dict[st
         path = original_path
         ext = Path(path).suffix.lower()
         info = _probe_media(path)
+        source_title = str(info.get("title") or _title_from_path(path))[:200]
         if ext in IMAGE_EXTS:
             kind = "image"
         elif mp3 or ext == ".mp3":
@@ -1186,6 +1267,9 @@ def _prepare_files(paths: list[str], root_dir: str, mp3: bool, progress: dict[st
         if kind == "video":
             path = _normalize_video_for_telegram(path, root_dir, source_index, progress=progress)
         output_info = _probe_media(path)
+        source_title = str(output_info.get("title") or source_title or _title_from_path(original_path))[:200]
+        safe_title = _safe_filename_title(source_title)
+        path = _rename_media_file(path, f"{source_index:02d} - {safe_title}")
         output_ext = Path(path).suffix.lower()
         streamable_mp4 = (
             output_ext == ".mp4" and output_info.get("has_video")
@@ -1197,6 +1281,12 @@ def _prepare_files(paths: list[str], root_dir: str, mp3: bool, progress: dict[st
             file_parts = [path]
         elif kind in {"video", "audio"}:
             file_parts = _split_oversized(path, root_dir, kind)
+            named_parts: list[str] = []
+            for split_index, split_path in enumerate(file_parts, start=1):
+                named_parts.append(_rename_media_file(
+                    split_path, f"{source_index:02d} - {safe_title} - Part {split_index}-of-{len(file_parts)}"
+                ))
+            file_parts = named_parts
         else:
             raise RuntimeError(f"File {Path(path).name} exceeds Telegram's upload limit and cannot be split.")
         if len(prepared) + len(file_parts) > MAX_PARTS:
@@ -1213,7 +1303,7 @@ def _prepare_files(paths: list[str], root_dir: str, mp3: bool, progress: dict[st
                 "path": part, "kind": kind, "video": is_video, "audio": is_audio,
                 "width": pinfo.get("width"), "height": pinfo.get("height"),
                 "duration": int(pinfo.get("duration") or 0),
-                "title": str(pinfo.get("title") or Path(original_path).stem)[:200],
+                "title": str(output_info.get("title") or source_title or _title_from_path(original_path))[:200],
                 "artist": str(pinfo.get("artist") or "")[:100],
                 "thumbnail": thumbnail,
                 "conversion_fallback": conversion_fallback,
@@ -1382,7 +1472,8 @@ async def _send_instagram_album(message, items: list[dict[str, Any]], total_sour
                 path = item["path"]
                 stream = open(path, "rb")
                 streams.append(stream)
-                caption = (f"Instagram carousel · {int(item.get('source_index') or index)}/{total_sources}"
+                title = str(item.get("title") or "Instagram carousel")[:160]
+                caption = (f"{title}\nInstagram carousel · {int(item.get('source_index') or index)}/{total_sources}"
                            if index == 1 else None)
                 if item["kind"] == "image":
                     media.append(InputMediaPhoto(media=stream, caption=caption))
@@ -1417,7 +1508,8 @@ async def _send_instagram_album(message, items: list[dict[str, Any]], total_sour
         log.info("Instagram album upload was rejected; falling back to separate media (%s)", str(exc)[:120])
         for index, item in enumerate(items, start=1):
             source_index = int(item.get("source_index") or index)
-            await _send_prepared(message, item, f"Instagram carousel · {source_index}/{total_sources}")
+            item_title = str(item.get("title") or "Instagram carousel")[:160]
+            await _send_prepared(message, item, f"{item_title} · Instagram carousel {source_index}/{total_sources}")
 
 
 def _album_eligible(item: dict[str, Any]) -> bool:
@@ -1629,16 +1721,17 @@ async def _run_pipeline(
                                 upload_error = type(exc).__name__
                                 log.exception("Instagram carousel album upload failed")
                                 break
+                    media_title = str(item.get("title") or _title_from_path(item["path"]) or "Downloaded media")[:180]
                     if item["part_count"] > 1:
-                        caption = f"Media {item['source_index']}/{item['source_count']} — Part {item['part_index']}/{item['part_count']}"
+                        caption = f"{media_title} — Part {item['part_index']}/{item['part_count']}"
                     elif item["source_count"] > 1:
-                        caption = f"Media {item['source_index']}/{item['source_count']}"
+                        caption = f"{media_title} — Media {item['source_index']}/{item['source_count']}"
                     elif item.get("conversion_fallback"):
-                        caption = "Downloaded successfully — original format (playback support depends on your app)"
+                        caption = f"{media_title}\nOriginal format (playback support depends on your app)"
                     elif item.get("video") and item.get("height"):
-                        caption = f"Downloaded successfully · {int(item['height'])}p"
+                        caption = f"{media_title}\nDownloaded · {int(item['height'])}p"
                     else:
-                        caption = "Downloaded successfully"
+                        caption = media_title
                     try:
                         await context.bot.send_chat_action(
                             chat_id=update.effective_chat.id,
@@ -1729,6 +1822,122 @@ async def download_job(
     finally:
         _active_users.discard(uid)
 
+def _expand_playlist_links(url: str) -> list[str]:
+    """Resolve a bounded YouTube playlist to individual URLs using yt-dlp flat metadata."""
+    with tempfile.TemporaryDirectory(prefix="dlqueue_playlist_", dir=WORK_DIR) as td:
+        command = ["yt-dlp", "--ignore-config", "--dump-single-json", "--flat-playlist",
+                   "--playlist-end", str(MAX_PLAYLIST), "--no-warnings", "--remote-components", "ejs:github"]
+        command += _cookie_args(td)
+        command.append(url)
+        result = _run_capture(command, 120)
+        if result.returncode != 0:
+            detail = _clean_ytdlp_error((result.stdout + "\n" + result.stderr).splitlines())
+            raise RuntimeError(detail or "Could not read this playlist.")
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("The playlist response was not valid JSON.") from exc
+        entries = payload.get("entries") or []
+        links: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            target = entry.get("webpage_url") or entry.get("original_url")
+            if not target:
+                raw = entry.get("url")
+                if isinstance(raw, str) and raw.startswith(("http://", "https://")):
+                    target = raw
+            if not target and entry.get("id"):
+                extractor = str(entry.get("ie_key") or entry.get("extractor_key") or "").lower()
+                if "youtube" in extractor or _is_youtube_url(url):
+                    target = f"https://www.youtube.com/watch?v={entry['id']}"
+            if target and target not in links:
+                links.append(str(target))
+            if len(links) >= MAX_PLAYLIST:
+                break
+        if not links:
+            raise RuntimeError("No public items were found in this playlist. It may be private or unsupported.")
+        return links
+
+
+async def download_batch_job(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    urls: list[str],
+) -> None:
+    """Reserve this user's queue and serialize it with all other downloads."""
+    user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
+        return
+    uid = user.id
+    if uid in _active_users:
+        await reply_text_auto(context, message, "You already have a queue running. Please wait for it to finish.")
+        return
+    wait = _rate_remaining(uid)
+    if wait:
+        await reply_text_auto(context, message, f"Please wait {wait} second(s) before starting a new queue.")
+        return
+    _active_users.add(uid)
+    try:
+        async with context.bot_data["download_semaphore"]:
+            await _download_batch_locked(update, context, urls)
+    finally:
+        _active_users.discard(uid)
+
+
+async def _download_batch_locked(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    urls: list[str],
+) -> None:
+    message = update.effective_message
+    setup_status = await reply_text_auto(context, message, "Preparing your sequential download queue…")
+    expanded: list[str] = []
+    setup_failures = 0
+    pool = context.bot_data["pool"]
+    for position, raw_url in enumerate(urls, start=1):
+        if len(expanded) >= MAX_BATCH_LINKS:
+            break
+        try:
+            url = validate_url(raw_url)
+            if _is_youtube_playlist_url(url):
+                await safe_edit(setup_status, f"Reading playlist link {position}/{len(urls)}…")
+                playlist_links = await asyncio.get_running_loop().run_in_executor(
+                    pool, lambda link=url: _expand_playlist_links(link)
+                )
+                remaining = MAX_BATCH_LINKS - len(expanded)
+                expanded.extend(playlist_links[:remaining])
+            else:
+                expanded.append(url)
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError, TimeoutError) as exc:
+            setup_failures += 1
+            log.warning("Could not queue URL %s (%s)", position, type(exc).__name__)
+    if not expanded:
+        await safe_edit(setup_status, "No downloadable links could be queued. Check that the links are public and valid.")
+        schedule_auto_delete(context, setup_status)
+        return
+    await safe_edit(setup_status, f"Queue ready: {len(expanded)} link(s). Downloads will run one at a time.")
+    schedule_auto_delete(context, setup_status)
+    successes = 0
+    for index, link in enumerate(expanded, start=1):
+        # Do not reply to the original user message here: its auto-delete timer may
+        # have elapsed while earlier links were downloading.
+        item_status = await context.bot.send_message(
+            chat_id=message.chat_id,
+            text=f"Queue item {index}/{len(expanded)}: starting…",
+        )
+        ok = await _run_pipeline(update, context, link, status=item_status)
+        successes += int(ok)
+        if index < len(expanded):
+            await asyncio.sleep(1.05)
+    summary = f"Queue finished: {successes}/{len(expanded)} link(s) downloaded successfully."
+    if setup_failures:
+        summary += f" {setup_failures} playlist/URL item(s) could not be added."
+    summary_message = await context.bot.send_message(chat_id=message.chat_id, text=summary)
+    schedule_auto_delete(context, summary_message)
+
+
 # --------------------------- Commands ---------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message:
@@ -1762,20 +1971,30 @@ async def handle_sub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_message:
-        schedule_auto_delete(context, update.effective_message)
-    text = update.effective_message.text or ""
+    message = update.effective_message
+    if message:
+        schedule_auto_delete(context, message)
+    text = message.text or "" if message else ""
     if text.startswith("/"):
         return
-    url = first_url(text)
-    if not url:
-        await reply_text_auto(context, update.effective_message, "I couldn't find a valid URL. Please send a full HTTP/HTTPS link.")
+    urls = extract_urls(text)
+    if not urls:
+        await reply_text_auto(context, message, "I couldn't find a valid URL. Please send a full HTTP/HTTPS link.")
         return
-    if _active_users and update.effective_user and update.effective_user.id in _active_users:
-        await reply_text_auto(context, update.effective_message, "You already have a download running. Please wait.")
+    if len(urls) > MAX_BATCH_LINKS:
+        urls = urls[:MAX_BATCH_LINKS]
+        await reply_text_auto(context, message, f"The queue is limited to {MAX_BATCH_LINKS} links per message; the first {MAX_BATCH_LINKS} will be processed.")
+    if update.effective_user and update.effective_user.id in _active_users:
+        await reply_text_auto(context, message, "You already have a download running. Your new links were not queued; send them again after the current queue finishes.")
         return
-    host = (urlparse(url).hostname or "").lower()
-    if host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be":
+    if len(urls) > 1:
+        await download_batch_job(update, context, urls)
+        return
+    url = urls[0]
+    if _is_youtube_playlist_url(url):
+        # A single playlist URL starts the bounded, sequential playlist flow automatically.
+        await handle_playlist(update, context)
+    elif _is_youtube_url(url):
         await youtube_menu(update, context, url)
     else:
         await download_job(update, context, url)
@@ -1815,12 +2034,26 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
         return
 
     token = uuid.uuid4().hex[:8]
+    video_id = _youtube_video_id(url)
     _PENDING[token] = {"url": url, "uid": update.effective_user.id, "options": options,
                       "created": time.monotonic(), "message_id": None}
     rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
-    for index, (label, _) in enumerate(options):
-        row.append(InlineKeyboardButton(label, callback_data=f"pick_{token}_{index}"))
+    for index, (label, fmt) in enumerate(options):
+        if video_id:
+            owner = update.effective_user.id
+            if fmt == "__MP3__":
+                callback_data = f"ym:{video_id}:{owner}"
+            elif fmt == "__AUTO__":
+                callback_data = f"ya:{video_id}:{owner}"
+            else:
+                height_match = re.search(r"(1080|720|480|360|240|144)", label)
+                height = int(height_match.group(1)) if height_match else 1080
+                callback_data = f"yq:{video_id}:{height}:{owner}"
+        else:
+            # Fallback for unusual YouTube URL forms. These legacy tokens are process-local.
+            callback_data = f"pick_{token}_{index}"
+        row.append(InlineKeyboardButton(label, callback_data=callback_data))
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -1881,6 +2114,38 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     query = update.callback_query
     await query.answer()
     data = query.data or ""
+    # Self-contained YouTube callbacks remain valid if Render restarts and loses RAM state.
+    if data.startswith(("yq:", "ya:", "ym:")):
+        try:
+            fields = data.split(":")
+            action = fields[0]
+            video_id = fields[1]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", video_id):
+                raise ValueError("invalid video id")
+            if action == "yq:" or action == "yq":
+                if len(fields) != 4:
+                    raise ValueError("invalid quality callback")
+                height, owner = int(fields[2]), int(fields[3])
+            else:
+                if len(fields) != 3:
+                    raise ValueError("invalid callback")
+                owner = int(fields[2])
+                height = 0
+            if owner != query.from_user.id:
+                await reply_text_auto(context, query.message, "This download menu belongs to another user.")
+                return
+            source_url = f"https://www.youtube.com/watch?v={video_id}"
+            if action == "ym":
+                await download_job(update, context, source_url, mp3=True)
+            elif action == "ya":
+                _user_quality[query.from_user.id] = None
+                await download_job(update, context, source_url)
+            elif action == "yq":
+                await download_job(update, context, source_url, force_fmt=_quality_selector(height))
+            return
+        except (ValueError, IndexError):
+            await reply_text_auto(context, query.message, "This menu button is invalid. Send the video link again.")
+            return
     if data == "quality_menu":
         await send_quality_menu(query.message, context)
         return
@@ -2214,6 +2479,7 @@ def check_runtime() -> None:
         if shutil.which(executable) is None:
             raise RuntimeError(f"Required executable '{executable}' was not found in PATH.")
     result = _run_capture(["yt-dlp", "--version"], 20)
+    log.info("Bot version: %s", BOT_VERSION)
     log.info("yt-dlp version: %s", result.stdout.strip() or "unknown")
     deno = shutil.which("deno")
     log.info("Deno runtime: %s", deno or "not detected (some YouTube downloads may fail)")
