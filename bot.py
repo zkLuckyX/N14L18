@@ -217,8 +217,8 @@ def _base_env() -> dict[str, str]:
     return env
 
 
-def _cookie_args(workdir: str) -> list[str]:
-    raw = os.environ.get("YOUTUBE_COOKIES", "").strip()
+def _cookie_args(workdir: str, env_name: str = "YOUTUBE_COOKIES") -> list[str]:
+    raw = os.environ.get(env_name, "").strip()
     if not raw:
         return []
     # Set YOUTUBE_COOKIES to the Netscape cookie file contents; represent newlines as \n if needed.
@@ -354,7 +354,7 @@ def _download_media(
         "--remote-components", "ejs:github",
         "-o", _media_template(workdir),
     ]
-    command += _cookie_args(workdir)
+    command += _cookie_args(workdir, "INSTAGRAM_COOKIES" if is_instagram else "YOUTUBE_COOKIES")
     if not is_instagram:
         command.append("--no-playlist")
     else:
@@ -757,12 +757,43 @@ async def _upload_retry(send_callable):
     raise RuntimeError(f"Telegram upload failed after retries: {type(last_error).__name__ if last_error else 'unknown error'}")
 
 
+def _ensure_streamable_mp4(path: str) -> str:
+    """Transcode a non-mp4 video (webm/mkv/avi) into a Telegram-streamable mp4."""
+    out_path = str(Path(path).with_suffix(".mp4"))
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+        "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        "-c:a", "aac", "-b:a", "128k", out_path,
+    ]
+    if not _run_ffmpeg(command) or not os.path.exists(out_path):
+        return path
+    if os.path.getsize(out_path) > MAX_UPLOAD_BYTES:
+        os.remove(out_path)
+        return path
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return out_path
+
+
 async def _send_prepared(message, item: dict[str, Any], caption: str) -> None:
     path = item["path"]
+    ext = Path(path).suffix.lower()
+    # Videos that are not mp4 arrive unplayable in Telegram; convert before sending.
+    if item.get("video") and ext != ".mp4":
+        loop = asyncio.get_running_loop()
+        converted = await loop.run_in_executor(loop.get_default_executor(), _ensure_streamable_mp4, path)
+        if converted != path:
+            item["path"] = converted
+            item["width"], item["height"] = None, None
+            ext = ".mp4"
+            path = converted
     size = os.path.getsize(path)
     if size > MAX_UPLOAD_BYTES:
         raise RuntimeError(f"Refusing to upload an oversized part: {Path(path).name}")
-    ext = Path(path).suffix.lower()
     timeouts = {"read_timeout": 300, "write_timeout": 300, "connect_timeout": 30, "pool_timeout": 60}
     bot = message.get_bot()
     chat_id = message.chat_id
@@ -1234,9 +1265,19 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
         await status.delete()
     except TelegramError:
         pass
-    sent = await reply_text_auto(context, update.effective_message, 
-        caption, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows)
-    )
+    markup = InlineKeyboardMarkup(rows)
+    sent = None
+    thumb = str(meta.get("thumbnail") or "")
+    if thumb:
+        try:
+            sent = await update.effective_message.reply_photo(
+                photo=thumb, caption=caption, parse_mode="HTML", reply_markup=markup
+            )
+        except TelegramError as exc:
+            log.info("Thumbnail menu failed, using text menu (%s)", str(exc)[:100])
+    if sent is None:
+        sent = await reply_text_auto(context, update.effective_message,
+                                     caption, parse_mode="HTML", reply_markup=markup)
     _PENDING[token]["message_id"] = sent.message_id
     # Bound memory if the process has many old menus.
     cutoff = time.monotonic() - AUTO_DELETE_SECONDS
