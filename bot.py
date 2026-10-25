@@ -381,6 +381,78 @@ def _media_template(workdir: str) -> str:
     return os.path.join(workdir, "media_%(autonumber)03d_%(id)s.%(ext)s")
 
 
+def _is_instagram_post_url(url: str) -> bool:
+    """True for /p/ links, which can contain image-only or mixed carousels."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return (host == "instagram.com" or host.endswith(".instagram.com")) and bool(
+        re.search(r"^/p/[A-Za-z0-9_-]+/?$", parsed.path, re.IGNORECASE)
+    )
+
+
+def _collect_media_files(workdir: str, printed_paths: list[str] | None = None) -> list[str]:
+    """Collect completed media outputs only; ignore partials and sidecar files."""
+    found: set[str] = set()
+    for line in printed_paths or []:
+        candidate = Path(line.strip().strip('"'))
+        try:
+            if candidate.is_file() and candidate.stat().st_size > 0 and candidate.suffix.lower() in MEDIA_EXTS and not candidate.name.endswith((".part", ".ytdl")):
+                found.add(str(candidate.resolve()))
+        except OSError:
+            continue
+    for path in Path(workdir).rglob("*"):
+        try:
+            if path.is_file() and path.stat().st_size > 0 and path.suffix.lower() in MEDIA_EXTS and not path.name.endswith((".part", ".ytdl")):
+                found.add(str(path.resolve()))
+        except OSError:
+            continue
+    return sorted(found)
+
+
+def _download_instagram_images(url: str, workdir: str, progress: dict[str, Any] | None = None) -> tuple[list[str], str]:
+    """Best-effort anonymous photo/carousel fallback using gallery-dl.
+
+    Instagram image-only posts are not video formats and therefore are outside
+    yt-dlp's video extraction path. This fallback uses no cookies and never tries
+    to bypass a login wall. The gallery-dl project currently documents Instagram
+    support with cookie-based access, so anonymous fallback is best-effort only.
+    """
+    if not _is_instagram_post_url(url):
+        return [], "Not an Instagram /p/ post"
+    gallery_dir = os.path.join(workdir, "gallerydl_images")
+    shutil.rmtree(gallery_dir, ignore_errors=True)
+    os.makedirs(gallery_dir, exist_ok=True)
+    command = [
+        "gallery-dl", "--no-input", "--no-colors", "--quiet",
+        "--directory", gallery_dir,
+        "--filename", "{post_shortcode}_{num:>03}.{extension}",
+        "--range", f"1-{MAX_PLAYLIST}",
+        "--filter", "extension in ('jpg', 'jpeg', 'png', 'webp', 'avif')",
+        url,
+    ]
+    if progress is not None:
+        progress.update(stage="Fetching Instagram carousel photos", pct="", spd="", done=0, total=0)
+    try:
+        return_code, tail = _run_streaming_command(command, min(DOWNLOAD_TIMEOUT, 120), None)
+    except FileNotFoundError:
+        return [], "Image fallback utility is not installed"
+    except (TimeoutError, OSError, subprocess.SubprocessError) as exc:
+        return [], f"Image fallback failed ({type(exc).__name__})"
+
+    images = [path for path in _collect_media_files(gallery_dir, tail)
+              if Path(path).suffix.lower() in IMAGE_EXTS]
+    oversized = [path for path in images if os.path.getsize(path) > MAX_SOURCE_BYTES]
+    if oversized:
+        return [], f"Instagram image exceeds the configured {MAX_SOURCE_BYTES // 1048576} MiB source limit"
+    if images:
+        log.info("Instagram anonymous image fallback retrieved %d photo(s)", len(images))
+        return images, ""
+    detail = _clean_ytdlp_error(tail)
+    if return_code == 0:
+        detail = "No public image files were returned"
+    return [], detail
+
+
 def _download_media(
     url: str,
     workdir: str,
@@ -392,28 +464,25 @@ def _download_media(
 ) -> list[str]:
     os.makedirs(workdir, exist_ok=True)
     is_instagram = _is_instagram_url(url)
+    instagram_post = _is_instagram_post_url(url)
     command_base = [
         "yt-dlp", "--ignore-config", "--no-warnings", "--newline",
         "--retries", "2", "--fragment-retries", "2", "--extractor-retries", "1",
         "--file-access-retries", "2", "--socket-timeout", "15",
         "--concurrent-fragments", "4", "--trim-filenames", "100",
         "--remote-components", "ejs:github",
-        # Emit each final media path explicitly. Instagram gallery extractors can
-        # report playlist completion even when the output template is normalized
-        # differently; relying only on a filename prefix can miss successful files.
         "--print", "after_move:filepath",
         "-o", _media_template(workdir),
     ]
-    # Instagram is attempted anonymously, with browser TLS/client impersonation when
-    # curl-cffi is installed. This uses no login cookies and is best-effort only.
+    # Instagram posts can mix video slides and photos. yt-dlp can save the video
+    # slides while ignoring photo slides that have no video format.
     if is_instagram:
-        command_base += ["--impersonate", os.environ.get("INSTAGRAM_IMPERSONATE", "chrome")]
+        command_base += ["--impersonate", os.environ.get("INSTAGRAM_IMPERSONATE", "chrome"), "--ignore-errors"]
     else:
         command_base += _cookie_args(workdir)
     if not is_instagram:
         command_base.append("--no-playlist")
     else:
-        # Public galleries are extractor playlists; keep a strict item cap and ordering.
         command_base += ["--yes-playlist", "--playlist-end", str(MAX_PLAYLIST)]
     if progress is not None:
         command_base += [
@@ -430,29 +499,25 @@ def _download_media(
         ]
     elif fmt and fmt != "best":
         command_base += ["-f", fmt]
-    # Ensure DASH MP4+M4A merges produce an MP4 container, but codec normalization
-    # below remains authoritative for Telegram playback compatibility.
     if not mp3 and not subtitles and not is_instagram:
         command_base += ["--merge-output-format", "mp4"]
 
     candidates = _instagram_url_candidates(url) if is_instagram else [url]
     return_code = 1
     tail: list[str] = []
+    files: list[str] = []
     for candidate_index, candidate in enumerate(candidates):
         if candidate_index:
-            # A failed first Instagram extraction may leave fragments behind; do not
-            # accidentally treat partial files as a successful retry's result.
-            for name in os.listdir(workdir):
-                if name.startswith("media_") or name.endswith((".part", ".ytdl")):
-                    try:
-                        os.remove(os.path.join(workdir, name))
-                    except OSError:
-                        pass
+            # Remove partial downloads from the previous URL variant before retrying.
+            for path in Path(workdir).rglob("*"):
+                try:
+                    if path.is_file() and (path.name.startswith("media_") or path.name.endswith((".part", ".ytdl"))):
+                        path.unlink()
+                except OSError:
+                    pass
         command = command_base + [candidate]
         if progress is not None:
             progress["stage"] = "Downloading"
-        # Instagram is tried at most twice with no required cookies; each attempt is
-        # bounded so a login wall/rate-limit cannot stall the job for 20 minutes.
         timeout = min(DOWNLOAD_TIMEOUT, 150) if is_instagram else (DOWNLOAD_TIMEOUT if not subtitles else 240)
         try:
             return_code, tail = _run_streaming_command(command, timeout, progress)
@@ -460,39 +525,51 @@ def _download_media(
             if not is_instagram or candidate_index == len(candidates) - 1:
                 raise
             return_code, tail = 124, [str(exc)]
-        if return_code == 0:
+        files = _collect_media_files(workdir, tail) if not subtitles else [
+            str(path.resolve()) for path in Path(workdir).rglob("*")
+            if path.is_file() and path.suffix.lower() in {".srt", ".vtt", ".ass", ".ssa"}
+        ]
+        # For Instagram, a playlist may return non-zero for photo-only slides but
+        # still have produced valid video files. Keep those files instead of losing
+        # the whole post; gallery-dl below handles its image slides separately.
+        if files and (return_code == 0 or is_instagram):
             break
-        if not is_instagram or candidate_index == len(candidates) - 1:
-            raise RuntimeError(_clean_ytdlp_error(tail))
-    if return_code != 0:
-        raise RuntimeError(_clean_ytdlp_error(tail))
+        if candidate_index < len(candidates) - 1:
+            continue
+        if return_code != 0:
+            break
 
-    if subtitles:
-        files = [str(path) for path in Path(workdir).rglob("*")
-                 if path.is_file() and path.suffix.lower() in {".srt", ".vtt", ".ass", ".ssa"}]
-    else:
-        # Prefer yt-dlp's explicit after_move paths, which remain correct after
-        # merge/post-processing and for Instagram carousel/gallery extractors.
-        files = []
-        for line in tail:
-            candidate = Path(line.strip().strip('"'))
-            if candidate.is_file() and candidate.suffix.lower() in MEDIA_EXTS:
-                files.append(str(candidate.resolve()))
-        # Some yt-dlp builds do not print after_move paths for every extractor.
-        # Fall back to a recursive scan rather than assuming a top-level media_
-        # filename. Exclude partials and sidecar metadata by extension.
-        if not files:
-            files = [str(path.resolve()) for path in Path(workdir).rglob("*")
-                     if path.is_file() and path.suffix.lower() in MEDIA_EXTS
-                     and not path.name.endswith((".part", ".ytdl"))]
-    files = sorted(set(files))
+    if not subtitles and is_instagram:
+        had_no_video_formats = any("no video formats found" in line.lower() for line in tail)
+        # Add photo/carousel slides when yt-dlp reports entries with no video format.
+        # For image-only posts, this is also the primary fallback after yt-dlp yields no files.
+        if instagram_post and (not files or had_no_video_formats):
+            photo_files, photo_error = _download_instagram_images(url, workdir, progress)
+            if photo_files:
+                files = sorted(set(files + photo_files))
+            elif not files:
+                summary = (
+                    "Instagram returned no video formats. This often means the /p/ post contains photos, "
+                    "not video streams. The bot tried its no-cookie image fallback, but Instagram did not "
+                    "expose downloadable public media. If Instagram requires sign-in or rate-limits the server, "
+                    "a no-cookie download cannot be guaranteed."
+                )
+                log.warning("Instagram photo fallback did not return media (%s)", photo_error[:180])
+                raise RuntimeError(summary)
+            else:
+                # Some carousel video slides were saved but its photo slides were not accessible anonymously.
+                if progress is not None:
+                    progress["instagram_gallery_warning"] = "Some photo slides were not available anonymously."
+                log.warning("Instagram partial carousel: photo fallback unavailable (%s)", photo_error[:180])
+
     if not files:
+        if return_code != 0 and not is_instagram:
+            raise RuntimeError(_clean_ytdlp_error(tail))
         tail_message = _clean_ytdlp_error(tail)
-        if "finished downloading playlist" in tail_message.lower():
+        if is_instagram and not subtitles and "no video formats found" in tail_message.lower():
             raise RuntimeError(
-                "Instagram reported the post/playlist as finished, but yt-dlp produced no media file. "
-                "This can happen when Instagram blocks anonymous media access or returns metadata only. "
-                "No success was reported; try a publicly accessible post again later."
+                "Instagram exposed no video formats and the image fallback found no public files. "
+                "The post may be image-only or inaccessible to anonymous requests."
             )
         raise RuntimeError(tail_message or "No media files were produced.")
     for path in files:
@@ -1538,7 +1615,10 @@ async def _run_pipeline(
                         source_kind = "audio"
                     bump_stats(uid, source_kind, source_bytes)
                 bump_bundle_stats(uid, sent)
-                await safe_edit(status, f"Done! Sent {sent} file(s) successfully.")
+                final_note = f"Done! Sent {sent} file(s) successfully."
+                if progress.get("instagram_gallery_warning"):
+                    final_note += " Some photo slides could not be fetched anonymously."
+                await safe_edit(status, final_note)
                 schedule_auto_delete(context, status)
                 return True
 

@@ -4,7 +4,7 @@ FILES
 - bot.py: Telegram media bot with YouTube quality menu, thumbnails, MP3 metadata,
   public Instagram best-effort downloads, carousel albums, progress updates, 10-minute
   cleanup for source/text/status messages, stats/history, and splitting for large media.
-- requirements.txt: Python Telegram bot dependency plus current yt-dlp release line.
+- requirements.txt: Telegram bot, yt-dlp, curl-cffi, and gallery-dl dependencies.
 - Dockerfile: Python 3.12, FFmpeg, Deno, and Python dependency installation.
 - render.yaml: Render Blueprint and safe upload/source defaults.
 
@@ -25,6 +25,10 @@ IMPORTANT BEHAVIOUR
   no code can guarantee every reel without valid public access. Private/login-only content fails
   with a clear error rather than being reported as downloaded.
 - Instagram galleries are capped by MAX_PLAYLIST and sent as Telegram albums when supported.
+  For mixed /p/ carousels, yt-dlp is allowed to skip photo-only slides while preserving video slides.
+  When yt-dlp reports "No video formats found", gallery-dl is tried as a separate image-only fallback.
+  This fallback does not use Instagram cookies and is best-effort only; gallery-dl currently lists
+  Instagram as a cookies-based extractor, so a host-blocked or login-gated post can still fail.
 - MP3 files include embedded metadata when available and are sent as Telegram audio.
 - The bot avoids sending WebM video as a generic document when it can convert it to MP4.
 
@@ -64,9 +68,12 @@ KNOWN LIMITATIONS
 - The local checks in this package do not replace a live test on your own Telegram chat and Render
   service. Third-party sites may change after deployment.
 
-v6 note:
-- Instagram/yt-dlp final output paths are collected from after_move:filepath and
-  a recursive media-file fallback, fixing cases where an Instagram gallery reports
-  playlist completion but top-level filename matching misses its media files.
-- curl-cffi is installed for yt-dlp's optional browser impersonation support.
-- Anonymous Instagram access remains best-effort; private/login-gated posts may fail.
+v7 note:
+- Instagram /p/ posts use yt-dlp with per-item errors ignored, so a photo slide doesn't
+  discard downloadable videos from the same carousel.
+- If yt-dlp produces no video files or reports "No video formats found", a bounded
+  gallery-dl image fallback attempts to retrieve public carousel photos without cookies.
+- In a mixed carousel, downloadable videos can still be sent if anonymous image retrieval
+  fails; the final status warns that some photo slides were unavailable.
+- The fallback is tested with synthetic/mock outputs only. Real Instagram access must be
+  tested after deployment because the platform may block anonymous requests.

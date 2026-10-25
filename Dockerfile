@@ -22,7 +22,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && yt-dlp --version \
+    && gallery-dl --version \
+    && ffmpeg -version | head -n 1
 COPY bot.py ./bot.py
 
 CMD ["python", "-u", "bot.py"]
