@@ -409,13 +409,66 @@ def _collect_media_files(workdir: str, printed_paths: list[str] | None = None) -
     return sorted(found)
 
 
-def _download_instagram_images(url: str, workdir: str, progress: dict[str, Any] | None = None) -> tuple[list[str], str]:
-    """Best-effort anonymous photo/carousel fallback using gallery-dl.
+def _download_instagram_thumbnail_fallback(
+    url: str, workdir: str, progress: dict[str, Any] | None = None,
+) -> tuple[list[str], str]:
+    """Best-effort public thumbnail/image fallback for image-only /p/ posts.
 
-    Instagram image-only posts are not video formats and therefore are outside
-    yt-dlp's video extraction path. This fallback uses no cookies and never tries
-    to bypass a login wall. The gallery-dl project currently documents Instagram
-    support with cookie-based access, so anonymous fallback is best-effort only.
+    yt-dlp is video-focused, but its maintainer recommends --write-thumbnail with
+    --ignore-no-formats-error for Instagram posts whose entries are photos. This
+    runs only when the main extractor produced no media, so video thumbnails from
+    a mixed carousel are never accidentally sent as if they were original photos.
+    It uses no cookies and does not bypass an Instagram login wall.
+    """
+    thumb_dir = os.path.join(workdir, "ytdlp_thumbnail_fallback")
+    shutil.rmtree(thumb_dir, ignore_errors=True)
+    os.makedirs(thumb_dir, exist_ok=True)
+    failures: list[str] = []
+    for candidate in _instagram_url_candidates(url):
+        command = [
+            "yt-dlp", "--ignore-config", "--no-warnings", "--no-progress",
+            "--ignore-no-formats-error", "--write-thumbnail", "--skip-download",
+            "--yes-playlist", "--playlist-end", str(MAX_PLAYLIST),
+            "--socket-timeout", "12", "--retries", "1", "--extractor-retries", "1",
+            "--impersonate", os.environ.get("INSTAGRAM_IMPERSONATE", "chrome"),
+            "-o", os.path.join(thumb_dir, "%(autonumber)03d_%(id)s.%(ext)s"),
+            candidate,
+        ]
+        if progress is not None:
+            progress.update(stage="Trying public Instagram thumbnail fallback", pct="", spd="", done=0, total=0)
+        try:
+            return_code, tail = _run_streaming_command(command, min(DOWNLOAD_TIMEOUT, 60), None)
+        except FileNotFoundError:
+            return [], "yt-dlp is not installed"
+        except (TimeoutError, OSError, subprocess.SubprocessError) as exc:
+            failures.append(type(exc).__name__)
+            continue
+        images = [
+            path for path in _collect_media_files(thumb_dir, tail)
+            if Path(path).suffix.lower() in IMAGE_EXTS and os.path.getsize(path) <= MAX_SOURCE_BYTES
+        ]
+        if images:
+            log.info("Instagram public thumbnail fallback retrieved %d image(s)", len(images))
+            return images, ""
+        failures.append(_clean_ytdlp_error(tail) if tail else f"yt-dlp exited {return_code} without thumbnails")
+    shutil.rmtree(thumb_dir, ignore_errors=True)
+    return [], (failures[-1] if failures else "No public thumbnails were returned")
+
+
+def _download_instagram_images(
+    url: str,
+    workdir: str,
+    progress: dict[str, Any] | None = None,
+    *,
+    use_thumbnail_fallback: bool = False,
+) -> tuple[list[str], str]:
+    """Best-effort anonymous photo/carousel fallback without cookies.
+
+    gallery-dl is tried first. For image-only posts with no video/media output,
+    yt-dlp's write-thumbnail fallback is tried as a second public-access path.
+    Both are bounded, and neither bypasses a login wall. If Instagram blocks the
+    server or exposes no image URL, downloading without authenticated access cannot
+    be guaranteed.
     """
     if not _is_instagram_post_url(url):
         return [], "Not an Instagram /p/ post"
@@ -433,11 +486,11 @@ def _download_instagram_images(url: str, workdir: str, progress: dict[str, Any] 
     if progress is not None:
         progress.update(stage="Fetching Instagram carousel photos", pct="", spd="", done=0, total=0)
     try:
-        return_code, tail = _run_streaming_command(command, min(DOWNLOAD_TIMEOUT, 120), None)
+        return_code, tail = _run_streaming_command(command, min(DOWNLOAD_TIMEOUT, 75), None)
     except FileNotFoundError:
-        return [], "Image fallback utility is not installed"
+        return_code, tail = 127, ["gallery-dl is not installed"]
     except (TimeoutError, OSError, subprocess.SubprocessError) as exc:
-        return [], f"Image fallback failed ({type(exc).__name__})"
+        return_code, tail = 1, [f"gallery-dl failed ({type(exc).__name__})"]
 
     images = [path for path in _collect_media_files(gallery_dir, tail)
               if Path(path).suffix.lower() in IMAGE_EXTS]
@@ -447,10 +500,14 @@ def _download_instagram_images(url: str, workdir: str, progress: dict[str, Any] 
     if images:
         log.info("Instagram anonymous image fallback retrieved %d photo(s)", len(images))
         return images, ""
-    detail = _clean_ytdlp_error(tail)
-    if return_code == 0:
-        detail = "No public image files were returned"
-    return [], detail
+
+    gallery_detail = _clean_ytdlp_error(tail) if tail else f"gallery-dl exited {return_code} without images"
+    if use_thumbnail_fallback:
+        thumb_images, thumb_error = _download_instagram_thumbnail_fallback(url, workdir, progress)
+        if thumb_images:
+            return thumb_images, ""
+        return [], f"gallery-dl: {gallery_detail}; public thumbnail fallback: {thumb_error}"
+    return [], gallery_detail
 
 
 def _download_media(
@@ -544,7 +601,9 @@ def _download_media(
         # Add photo/carousel slides when yt-dlp reports entries with no video format.
         # For image-only posts, this is also the primary fallback after yt-dlp yields no files.
         if instagram_post and (not files or had_no_video_formats):
-            photo_files, photo_error = _download_instagram_images(url, workdir, progress)
+            photo_files, photo_error = _download_instagram_images(
+                url, workdir, progress, use_thumbnail_fallback=not bool(files)
+            )
             if photo_files:
                 files = sorted(set(files + photo_files))
             elif not files:

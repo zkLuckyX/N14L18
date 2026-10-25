@@ -68,12 +68,12 @@ KNOWN LIMITATIONS
 - The local checks in this package do not replace a live test on your own Telegram chat and Render
   service. Third-party sites may change after deployment.
 
-v7 note:
-- Instagram /p/ posts use yt-dlp with per-item errors ignored, so a photo slide doesn't
-  discard downloadable videos from the same carousel.
-- If yt-dlp produces no video files or reports "No video formats found", a bounded
-  gallery-dl image fallback attempts to retrieve public carousel photos without cookies.
-- In a mixed carousel, downloadable videos can still be sent if anonymous image retrieval
-  fails; the final status warns that some photo slides were unavailable.
-- The fallback is tested with synthetic/mock outputs only. Real Instagram access must be
-  tested after deployment because the platform may block anonymous requests.
+v8 note:
+- For image-only Instagram /p/ posts, the bot tries gallery-dl first and then a bounded
+  yt-dlp --write-thumbnail --ignore-no-formats-error --skip-download fallback if no media
+  file was produced. This can retrieve thumbnail/image files exposed by public post metadata,
+  but it does not bypass a login wall.
+- Thumbnail-only fallback is skipped if the main extractor already produced video/media files,
+  avoiding cover thumbnails being mistaken for original photos in mixed carousels.
+- Synthetic/mock tests pass; no live Instagram download was possible here. Instagram may still
+  block anonymous requests, so this remains best-effort rather than guaranteed.
