@@ -23,9 +23,3 @@ services:
         value: "480"
       - key: FFMPEG_TIMEOUT_SECONDS
         value: "240"
-      - key: VIDEO_TRANSCODE_TIMEOUT_SECONDS
-        value: "120"
-      - key: VIDEO_TRANSCODE_MAX_HEIGHT
-        value: "720"
-      - key: INSTAGRAM_IMPERSONATE
-        value: "chrome"

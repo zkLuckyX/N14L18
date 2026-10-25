@@ -398,6 +398,10 @@ def _download_media(
         "--file-access-retries", "2", "--socket-timeout", "15",
         "--concurrent-fragments", "4", "--trim-filenames", "100",
         "--remote-components", "ejs:github",
+        # Emit each final media path explicitly. Instagram gallery extractors can
+        # report playlist completion even when the output template is normalized
+        # differently; relying only on a filename prefix can miss successful files.
+        "--print", "after_move:filepath",
         "-o", _media_template(workdir),
     ]
     # Instagram is attempted anonymously, with browser TLS/client impersonation when
@@ -464,14 +468,33 @@ def _download_media(
         raise RuntimeError(_clean_ytdlp_error(tail))
 
     if subtitles:
-        files = [str(Path(workdir) / name) for name in os.listdir(workdir)
-                 if name.lower().endswith((".srt", ".vtt", ".ass", ".ssa"))]
+        files = [str(path) for path in Path(workdir).rglob("*")
+                 if path.is_file() and path.suffix.lower() in {".srt", ".vtt", ".ass", ".ssa"}]
     else:
-        files = [str(Path(workdir) / name) for name in os.listdir(workdir)
-                 if name.startswith("media_") and Path(name).suffix.lower() in MEDIA_EXTS]
-    files = sorted(files)
+        # Prefer yt-dlp's explicit after_move paths, which remain correct after
+        # merge/post-processing and for Instagram carousel/gallery extractors.
+        files = []
+        for line in tail:
+            candidate = Path(line.strip().strip('"'))
+            if candidate.is_file() and candidate.suffix.lower() in MEDIA_EXTS:
+                files.append(str(candidate.resolve()))
+        # Some yt-dlp builds do not print after_move paths for every extractor.
+        # Fall back to a recursive scan rather than assuming a top-level media_
+        # filename. Exclude partials and sidecar metadata by extension.
+        if not files:
+            files = [str(path.resolve()) for path in Path(workdir).rglob("*")
+                     if path.is_file() and path.suffix.lower() in MEDIA_EXTS
+                     and not path.name.endswith((".part", ".ytdl"))]
+    files = sorted(set(files))
     if not files:
-        raise RuntimeError(_clean_ytdlp_error(tail) or "No media files were produced.")
+        tail_message = _clean_ytdlp_error(tail)
+        if "finished downloading playlist" in tail_message.lower():
+            raise RuntimeError(
+                "Instagram reported the post/playlist as finished, but yt-dlp produced no media file. "
+                "This can happen when Instagram blocks anonymous media access or returns metadata only. "
+                "No success was reported; try a publicly accessible post again later."
+            )
+        raise RuntimeError(tail_message or "No media files were produced.")
     for path in files:
         if os.path.getsize(path) > MAX_SOURCE_BYTES:
             raise RuntimeError(
