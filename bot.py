@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from telegram import (
     InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand,
@@ -217,11 +218,14 @@ def _base_env() -> dict[str, str]:
     return env
 
 
-def _cookie_args(workdir: str, env_name: str = "YOUTUBE_COOKIES") -> list[str]:
-    raw = os.environ.get(env_name, "").strip()
+def _cookie_args(workdir: str, *, instagram: bool = False) -> list[str]:
+    # Render has no browser profile to read cookies from; accept exported Netscape-format
+    # cookie contents through an environment secret. Keep Instagram cookies separate.
+    env_key = "INSTAGRAM_COOKIES" if instagram else "YOUTUBE_COOKIES"
+    raw = os.environ.get(env_key, "").strip()
     if not raw:
         return []
-    # Set YOUTUBE_COOKIES to the Netscape cookie file contents; represent newlines as \n if needed.
+    # Represent newlines as \n when setting a multiline secret in Render.
     cookie_file = os.path.join(workdir, "cookies.txt")
     with open(cookie_file, "w", encoding="utf-8") as stream:
         stream.write(raw.replace("\\n", "\n"))
@@ -354,7 +358,7 @@ def _download_media(
         "--remote-components", "ejs:github",
         "-o", _media_template(workdir),
     ]
-    command += _cookie_args(workdir, "INSTAGRAM_COOKIES" if is_instagram else "YOUTUBE_COOKIES")
+    command += _cookie_args(workdir, instagram=is_instagram)
     if not is_instagram:
         command.append("--no-playlist")
     else:
@@ -402,11 +406,55 @@ def _download_media(
     return files
 
 
+def _download_youtube_thumbnail(url: str, root_dir: str) -> str | None:
+    """Fetch an image from a YouTube thumbnail CDN and normalize it to a small JPEG.
+
+    The host allow-list prevents using extractor-supplied thumbnail URLs as an arbitrary
+    server-side fetch target. The caller removes the returned temporary file after sending.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    allowed = host in {"i.ytimg.com", "img.youtube.com"} or host.endswith(".ytimg.com")
+    if parsed.scheme != "https" or not allowed:
+        return None
+    os.makedirs(root_dir, exist_ok=True)
+    nonce = uuid.uuid4().hex
+    raw_path = os.path.join(root_dir, f"yt-thumb-{nonce}.source")
+    jpg_path = os.path.join(root_dir, f"yt-thumb-{nonce}.jpg")
+    try:
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(request, timeout=12) as response:
+            content_type = response.headers.get_content_type().lower()
+            if not content_type.startswith("image/"):
+                return None
+            data = response.read(2 * 1024 * 1024 + 1)
+        if not data or len(data) > 2 * 1024 * 1024:
+            return None
+        with open(raw_path, "wb") as stream:
+            stream.write(data)
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", raw_path,
+            "-frames:v", "1", "-vf", "scale=640:640:force_original_aspect_ratio=decrease",
+            "-q:v", "4", "-update", "1", jpg_path,
+        ]
+        if _run_ffmpeg(command, timeout=30) and os.path.isfile(jpg_path) and 0 < os.path.getsize(jpg_path) <= 200 * 1024:
+            return jpg_path
+        return None
+    except (OSError, TimeoutError, subprocess.SubprocessError) as exc:
+        log.info("Could not fetch YouTube thumbnail (%s)", type(exc).__name__)
+        return None
+    finally:
+        try:
+            os.remove(raw_path)
+        except OSError:
+            pass
+
+
 def _get_video_meta(url: str) -> dict[str, Any] | None:
     with tempfile.TemporaryDirectory(prefix="dlmeta_", dir=WORK_DIR) as td:
         command = ["yt-dlp", "--ignore-config", "--dump-single-json", "--no-playlist", "--skip-download",
                    "--no-warnings", "--remote-components", "ejs:github"]
-        command += _cookie_args(td)
+        command += _cookie_args(td, instagram=_is_instagram_url(url))
         command.append(url)
         try:
             result = _run_capture(command, 90)
@@ -464,7 +512,7 @@ def _probe_media(path: str) -> dict[str, Any]:
     try:
         result = _run_capture([
             "ffprobe", "-v", "error", "-show_entries",
-            "stream=codec_type,width,height:format=duration,format_name:format_tags=title,artist,album,performer,album_artist,uploader",
+            "stream=codec_type,codec_name,width,height:format=duration,format_name:format_tags=title,artist,album,performer,album_artist,uploader",
             "-of", "json", path,
         ], 30)
         if result.returncode != 0:
@@ -483,6 +531,8 @@ def _probe_media(path: str) -> dict[str, Any]:
             "duration": duration,
             "has_video": bool(video),
             "has_audio": bool(audio),
+            "video_codec": str(video.get("codec_name") or ""),
+            "audio_codec": str(audio.get("codec_name") or ""),
             "width": int(video.get("width") or 0),
             "height": int(video.get("height") or 0),
             "format_name": str(fmt.get("format_name") or ""),
@@ -504,6 +554,87 @@ def _run_ffmpeg(command: list[str], timeout: int = FFMPEG_TIMEOUT) -> bool:
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.warning("FFmpeg could not finish: %s", type(exc).__name__)
         return False
+
+
+def _normalize_video_for_telegram(path: str, root_dir: str, source_index: int) -> str:
+    """Create a streamable MP4 (H.264 + AAC, fast-start) for Telegram video messages.
+
+    Remux compatible H.264/AAC MP4 files without quality loss; transcode formats such as
+    WebM/VP9/Opus to H.264/AAC. Fail clearly rather than silently sending a generic document.
+    """
+    info = _probe_media(path)
+    if not info.get("has_video") and Path(path).suffix.lower() not in VIDEO_EXTS:
+        return path
+
+    os.makedirs(root_dir, exist_ok=True)
+    output = os.path.join(root_dir, f"streamable_{source_index:03d}.mp4")
+    try:
+        os.remove(output)
+    except FileNotFoundError:
+        pass
+
+    video_codec = str(info.get("video_codec") or "").lower()
+    audio_codec = str(info.get("audio_codec") or "").lower()
+    has_video = bool(info.get("has_video"))
+    if has_video and Path(path).suffix.lower() == ".mp4" and video_codec == "h264" and audio_codec in {"", "aac"}:
+        remux = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+            "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-c", "copy",
+            "-movflags", "+faststart", "-map_metadata", "0", output,
+        ]
+        if _run_ffmpeg(remux) and os.path.isfile(output) and os.path.getsize(output) > 0:
+            return output
+        try:
+            os.remove(output)
+        except OSError:
+            pass
+
+    # Telegram inline playback is most reliable with H.264, yuv420p and AAC.
+    transcode = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+        "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+        "-vf", "scale='min(1920,iw)':-2", "-c:v", "libx264", "-preset", "veryfast",
+        "-crf", "23", "-pix_fmt", "yuv420p", "-threads", "2",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+        "-map_metadata", "0", output,
+    ]
+    if not _run_ffmpeg(transcode, timeout=FFMPEG_TIMEOUT) or not os.path.isfile(output) or os.path.getsize(output) <= 0:
+        try:
+            os.remove(output)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Could not convert {Path(path).suffix or 'media'} to a playable MP4. Please retry or choose a lower quality."
+        )
+
+    final_info = _probe_media(output)
+    if not final_info.get("has_video") or final_info.get("video_codec") != "h264":
+        raise RuntimeError("Video conversion did not produce a valid H.264 MP4; refusing to send an unplayable file.")
+    if final_info.get("has_audio") and final_info.get("audio_codec") != "aac":
+        raise RuntimeError("Video audio conversion failed; refusing to send a non-standard video file.")
+    return output
+
+
+def _create_video_thumbnail(path: str, root_dir: str, source_index: int, part_index: int) -> str | None:
+    """Make a small JPEG preview Telegram can display before the uploaded video is opened."""
+    output = os.path.join(root_dir, f"preview_{source_index:03d}_{part_index:03d}.jpg")
+    info = _probe_media(path)
+    duration = float(info.get("duration") or 0)
+    seek = min(1.0, max(0.0, duration * 0.1))
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{seek:.3f}",
+        "-i", path, "-map", "0:v:0", "-frames:v", "1",
+        "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+        "-q:v", "5", "-update", "1", output,
+    ]
+    if _run_ffmpeg(command, timeout=45) and os.path.isfile(output) and 0 < os.path.getsize(output) <= 200 * 1024:
+        return output
+    try:
+        os.remove(output)
+    except OSError:
+        pass
+    log.info("Could not create preview thumbnail for %s", Path(path).name)
+    return None
 
 
 def _copy_split_attempt(path: str, attempt_dir: str, segment_seconds: int, kind: str) -> list[str]:
@@ -645,7 +776,9 @@ def _split_oversized(
 def _prepare_files(paths: list[str], root_dir: str, mp3: bool) -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
     source_count = len(paths)
-    for source_index, path in enumerate(paths, start=1):
+    for source_index, original_path in enumerate(paths, start=1):
+        original_size = os.path.getsize(original_path)
+        path = original_path
         ext = Path(path).suffix.lower()
         info = _probe_media(path)
         if ext in IMAGE_EXTS:
@@ -660,6 +793,10 @@ def _prepare_files(paths: list[str], root_dir: str, mp3: bool) -> list[dict[str,
             kind = "video"
         else:
             kind = "document"
+
+        # Convert WebM/non-H.264 media to standard MP4 before delivery.
+        if kind == "video":
+            path = _normalize_video_for_telegram(path, root_dir, source_index)
         if os.path.getsize(path) <= MAX_UPLOAD_BYTES:
             file_parts = [path]
         elif kind in {"video", "audio"}:
@@ -675,15 +812,17 @@ def _prepare_files(paths: list[str], root_dir: str, mp3: bool) -> list[dict[str,
             part_ext = Path(part).suffix.lower()
             is_video = bool(pinfo.get("has_video")) or (not pinfo and part_ext in VIDEO_EXTS)
             is_audio = not is_video and (bool(pinfo.get("has_audio")) or part_ext in AUDIO_EXTS)
+            thumbnail = _create_video_thumbnail(part, root_dir, source_index, part_index) if is_video and part_ext == ".mp4" else None
             prepared.append({
                 "path": part, "kind": kind, "video": is_video, "audio": is_audio,
                 "width": pinfo.get("width"), "height": pinfo.get("height"),
                 "duration": int(pinfo.get("duration") or 0),
-                "title": str(pinfo.get("title") or Path(path).stem)[:200],
+                "title": str(pinfo.get("title") or Path(original_path).stem)[:200],
                 "artist": str(pinfo.get("artist") or "")[:100],
+                "thumbnail": thumbnail,
                 "source_index": source_index, "source_count": source_count,
                 "part_index": part_index, "part_count": len(file_parts),
-                "source_bytes": os.path.getsize(path),
+                "source_bytes": original_size,
             })
     return prepared
 
@@ -757,43 +896,12 @@ async def _upload_retry(send_callable):
     raise RuntimeError(f"Telegram upload failed after retries: {type(last_error).__name__ if last_error else 'unknown error'}")
 
 
-def _ensure_streamable_mp4(path: str) -> str:
-    """Transcode a non-mp4 video (webm/mkv/avi) into a Telegram-streamable mp4."""
-    out_path = str(Path(path).with_suffix(".mp4"))
-    command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", path,
-        "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-        "-c:a", "aac", "-b:a", "128k", out_path,
-    ]
-    if not _run_ffmpeg(command) or not os.path.exists(out_path):
-        return path
-    if os.path.getsize(out_path) > MAX_UPLOAD_BYTES:
-        os.remove(out_path)
-        return path
-    try:
-        os.remove(path)
-    except OSError:
-        pass
-    return out_path
-
-
 async def _send_prepared(message, item: dict[str, Any], caption: str) -> None:
     path = item["path"]
-    ext = Path(path).suffix.lower()
-    # Videos that are not mp4 arrive unplayable in Telegram; convert before sending.
-    if item.get("video") and ext != ".mp4":
-        loop = asyncio.get_running_loop()
-        converted = await loop.run_in_executor(loop.get_default_executor(), _ensure_streamable_mp4, path)
-        if converted != path:
-            item["path"] = converted
-            item["width"], item["height"] = None, None
-            ext = ".mp4"
-            path = converted
     size = os.path.getsize(path)
     if size > MAX_UPLOAD_BYTES:
         raise RuntimeError(f"Refusing to upload an oversized part: {Path(path).name}")
+    ext = Path(path).suffix.lower()
     timeouts = {"read_timeout": 300, "write_timeout": 300, "connect_timeout": 30, "pool_timeout": 60}
     bot = message.get_bot()
     chat_id = message.chat_id
@@ -801,6 +909,20 @@ async def _send_prepared(message, item: dict[str, Any], caption: str) -> None:
     if item["video"] and ext == ".mp4":
         async def send_video():
             with open(path, "rb") as stream:
+                thumbnail_path = item.get("thumbnail")
+                if thumbnail_path and os.path.isfile(thumbnail_path):
+                    with open(thumbnail_path, "rb") as thumb_stream:
+                        return await bot.send_video(
+                            chat_id=chat_id,
+                            video=stream,
+                            thumbnail=thumb_stream,
+                            caption=caption[:1024] if caption else None,
+                            duration=item.get("duration") or None,
+                            width=item.get("width") or None,
+                            height=item.get("height") or None,
+                            supports_streaming=True,
+                            **timeouts,
+                        )
                 return await bot.send_video(
                     chat_id=chat_id,
                     video=stream,
@@ -811,12 +933,8 @@ async def _send_prepared(message, item: dict[str, Any], caption: str) -> None:
                     supports_streaming=True,
                     **timeouts,
                 )
-        try:
-            await _upload_retry(send_video)
-            return
-        except BadRequest as exc:
-            # Some MP4s use codecs Telegram cannot preview; a document fallback still delivers the file.
-            log.info("Video preview upload failed; trying document fallback (%s)", str(exc)[:120])
+        await _upload_retry(send_video)
+        return
 
     if item["audio"] and ext == ".mp3":
         async def send_audio():
@@ -872,8 +990,14 @@ async def _send_instagram_album(message, items: list[dict[str, Any]], total_sour
                 if item["kind"] == "image":
                     media.append(InputMediaPhoto(media=stream, caption=caption))
                 elif item["video"] and Path(path).suffix.lower() == ".mp4":
+                    thumbnail_path = item.get("thumbnail")
+                    if thumbnail_path and os.path.isfile(thumbnail_path):
+                        thumb_stream = open(thumbnail_path, "rb")
+                        streams.append(thumb_stream)
+                    else:
+                        thumb_stream = None
                     media.append(InputMediaVideo(
-                        media=stream, caption=caption,
+                        media=stream, thumbnail=thumb_stream, caption=caption,
                         duration=item.get("duration") or None,
                         width=item.get("width") or None,
                         height=item.get("height") or None,
@@ -1128,6 +1252,18 @@ async def _run_pipeline(
                 await safe_edit(status, f"Done! Sent {sent} file(s) successfully.")
                 return True
 
+            if _is_instagram_url(url):
+                lowered = last_error.lower()
+                if any(token in lowered for token in ("empty media response", "login", "cookies", "private", "not available")):
+                    if not os.environ.get("INSTAGRAM_COOKIES", "").strip():
+                        last_error = (
+                            "Instagram did not return the media. This reel may require login, be private, "
+                            "or be temporarily blocked. If you own/have permission to save it, add a valid "
+                            "Netscape cookie export as Render secret INSTAGRAM_COOKIES and redeploy; "
+                            "otherwise this post may not be accessible to the bot."
+                        )
+                    else:
+                        last_error = "Instagram did not return media. Check that INSTAGRAM_COOKIES is valid and the post is accessible to your account."
             await safe_edit(status, f"Download failed after retries: {last_error}")
             return False
     except Exception as exc:
@@ -1237,7 +1373,12 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
     for height in meta["heights"]:
         size = int(meta["sizes"].get(str(height), 0))
         label_size = f" — {size / 1048576:.1f} MiB" if size else ""
-        options.append((f"🎬 {height}p{label_size}", f"bv*[height<={height}]+ba/b[height<={height}]"))
+        selector = (
+            f"bv*[height<={height}][ext=mp4]+ba[ext=m4a]/"
+            f"b[height<={height}][ext=mp4]/"
+            f"bv*[height<={height}]+ba/b[height<={height}]"
+        )
+        options.append((f"🎬 {height}p{label_size}", selector))
     options += [("🎵 Download MP3", "__MP3__"), ("⚡ Automatic quality", "__AUTO__")]
     if not options:
         await safe_edit(status, "No quality menu is available. Starting an automatic download…")
@@ -1265,19 +1406,39 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
         await status.delete()
     except TelegramError:
         pass
-    markup = InlineKeyboardMarkup(rows)
+    keyboard = InlineKeyboardMarkup(rows)
     sent = None
-    thumb = str(meta.get("thumbnail") or "")
-    if thumb:
+    thumbnail_url = str(meta.get("thumbnail") or "")
+    thumbnail_path = None
+    if thumbnail_url:
+        thumbnail_path = await asyncio.get_running_loop().run_in_executor(
+            context.bot_data["pool"], lambda: _download_youtube_thumbnail(thumbnail_url, WORK_DIR)
+        )
+    if thumbnail_path:
         try:
-            sent = await update.effective_message.reply_photo(
-                photo=thumb, caption=caption, parse_mode="HTML", reply_markup=markup
-            )
-        except TelegramError as exc:
-            log.info("Thumbnail menu failed, using text menu (%s)", str(exc)[:100])
+            with open(thumbnail_path, "rb") as photo_stream:
+                sent = await update.effective_message.reply_photo(
+                    photo=photo_stream,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                    connect_timeout=20,
+                    read_timeout=30,
+                    write_timeout=30,
+                )
+            schedule_auto_delete(context, sent)
+        except Exception as exc:
+            log.info("Could not send YouTube thumbnail preview (%s); using text menu", type(exc).__name__)
+        finally:
+            try:
+                os.remove(thumbnail_path)
+            except OSError:
+                pass
     if sent is None:
-        sent = await reply_text_auto(context, update.effective_message,
-                                     caption, parse_mode="HTML", reply_markup=markup)
+        sent = await reply_text_auto(
+            context, update.effective_message, caption,
+            parse_mode="HTML", reply_markup=keyboard
+        )
     _PENDING[token]["message_id"] = sent.message_id
     # Bound memory if the process has many old menus.
     cutoff = time.monotonic() - AUTO_DELETE_SECONDS

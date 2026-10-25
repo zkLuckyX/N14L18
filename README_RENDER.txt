@@ -18,7 +18,16 @@ FEATURES ADDED
   them to Telegram's audio fields; uploader/channel is used as a metadata fallback when needed.
 - Instagram carousel posts are capped by MAX_PLAYLIST and eligible photo/video items are
   delivered as Telegram media albums of up to 10 items, preserving extractor order. If Telegram
-  rejects an album, the bot attempts to send the items individually.
+  rejects an album, the bot attempts to send the items individually. Some Instagram posts require
+  a valid logged-in session; configure INSTAGRAM_COOKIES only for media you are allowed to save.
+- YouTube quality menus include a thumbnail preview when the thumbnail CDN is reachable.
+  Downloaded video is normalized to MP4 with H.264/AAC and fast-start metadata, and the bot creates
+  a small JPEG preview and sends it as a Telegram video (supports_streaming=true). WebM files are
+  not silently sent as generic documents; if conversion fails, the bot reports an error instead.
+- Instagram authentication failures now return a clear message instead of implying a successful
+  download. Add INSTAGRAM_COOKIES in Render as a secret containing a Netscape-format cookie export
+  if a post requires login. Cookie data is sensitive and can grant access to your account; never
+  commit it to GitHub or share it, and revoke/replace the session if it is exposed.
 - Download progress shows a visual bar, percentage, transfer speed, and downloaded/total MiB
   when available.
 - /stats reports bundles, videos, audio files, images, source files, Telegram parts, and total
@@ -32,8 +41,10 @@ DEPLOY
 3. Add BOT_TOKEN in Render Environment settings. Never commit the token to GitHub.
 4. Deploy and check build/runtime logs. Test /start, then a short public video and /audio.
 5. Optional: set ADMIN_USER_IDS to comma-separated Telegram user IDs to enable /debug.
-6. Optional: set YOUTUBE_COOKIES to Netscape-format cookie-file contents only when legitimately
-   needed for content you can access. Treat this value as a secret.
+6. Optional: set YOUTUBE_COOKIES or INSTAGRAM_COOKIES to Netscape-format cookie-file contents
+   only when a site requires login for media you own or have permission to save. Treat cookies as
+   highly sensitive secrets; never commit them to GitHub. Instagram cookies are not required for
+   every post and cannot make a private post available unless the account has access to it.
 
 USEFUL ENVIRONMENT SETTINGS
 - AUTO_DELETE_SECONDS=600 (10 minutes; minimum accepted value is 60 seconds)
@@ -63,7 +74,8 @@ IMPORTANT LIMITATIONS
 
 VALIDATION PERFORMED FOR THIS PACKAGE REVISION
 - Python syntax compilation passed.
-- A stubbed import/helper test passed for module setup, FFprobe MP3 title/artist read-back,
-  backward-compatible stats upgrades, Instagram URL classification, and message-delete scheduling.
-- FFprobe was independently tested against a generated MP3 carrying title and artist tags.
-- These are local/helper-level checks, not a live Telegram upload or Render deployment test.
+- Local FFmpeg/FFprobe test generated a VP9/Opus WebM, converted it to H.264/AAC MP4, verified
+  the output codecs, generated a JPEG thumbnail, and confirmed prepared videos use MP4 plus preview.
+- Previous helper-level tests covered MP3 title/artist metadata, stats compatibility, Instagram URL
+  classification, and message-delete scheduling. This code update was not tested against live
+  Telegram APIs, a live YouTube download, an authenticated Instagram account, or Render deployment.

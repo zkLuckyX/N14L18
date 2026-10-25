@@ -9,6 +9,8 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
+      - key: INSTAGRAM_COOKIES
+        sync: false
       - key: MAX_UPLOAD_MIB
         value: "45"
       - key: MAX_SOURCE_MIB
