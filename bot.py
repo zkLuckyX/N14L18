@@ -56,8 +56,8 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MIB", "45")) * 1024 * 1024
 MAX_SOURCE_BYTES = int(os.environ.get("MAX_SOURCE_MIB", "1024")) * 1024 * 1024
 MAX_PLAYLIST = max(1, min(int(os.environ.get("MAX_PLAYLIST", "10")), 20))
 USER_COOLDOWN = max(0, int(os.environ.get("USER_COOLDOWN_SECONDS", "15")))
-DOWNLOAD_TIMEOUT = max(120, int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "1200")))
-FFMPEG_TIMEOUT = max(120, int(os.environ.get("FFMPEG_TIMEOUT_SECONDS", "600")))
+DOWNLOAD_TIMEOUT = max(90, int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "480")))
+FFMPEG_TIMEOUT = max(60, int(os.environ.get("FFMPEG_TIMEOUT_SECONDS", "240")))
 AUTO_DELETE_SECONDS = max(60, int(os.environ.get("AUTO_DELETE_SECONDS", "600")))
 MAX_PARTS = 128
 MAX_SPLIT_DEPTH = 8
@@ -218,20 +218,16 @@ def _base_env() -> dict[str, str]:
     return env
 
 
-def _cookie_args(workdir: str, *, instagram: bool = False) -> list[str]:
-    # Render has no browser profile to read cookies from; accept exported Netscape-format
-    # cookie contents through an environment secret. Keep Instagram cookies separate.
-    env_key = "INSTAGRAM_COOKIES" if instagram else "YOUTUBE_COOKIES"
-    raw = os.environ.get(env_key, "").strip()
+def _cookie_args(workdir: str) -> list[str]:
+    """Read an optional YouTube cookie secret; Instagram cookies are intentionally unused."""
+    raw = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if not raw:
         return []
-    # Represent newlines as \n when setting a multiline secret in Render.
     cookie_file = os.path.join(workdir, "cookies.txt")
     with open(cookie_file, "w", encoding="utf-8") as stream:
         stream.write(raw.replace("\\n", "\n"))
     os.chmod(cookie_file, 0o600)
     return ["--cookies", cookie_file]
-
 
 def _stop_process(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
@@ -334,6 +330,24 @@ def _is_instagram_url(url: str) -> bool:
     return host == "instagram.com" or host.endswith(".instagram.com")
 
 
+def _instagram_url_candidates(url: str) -> list[str]:
+    """Try the supplied public Instagram URL, then a canonical tracking-free URL.
+
+    This is a conservative URL normalization retry, not an authentication bypass.
+    Private/login-gated content remains inaccessible without legitimate access.
+    """
+    candidates = [url]
+    parsed = urlparse(url)
+    match = re.search(r"/(reel|reels|p|tv)/([A-Za-z0-9_-]+)", parsed.path, re.IGNORECASE)
+    if match:
+        kind, shortcode = match.group(1).lower(), match.group(2)
+        # 'reels' is commonly shared as 'reel'; keep canonical public route simple.
+        if kind == "reels":
+            kind = "reel"
+        candidates.append(f"https://www.instagram.com/{kind}/{shortcode}/")
+    return list(dict.fromkeys(candidates))
+
+
 def _media_template(workdir: str) -> str:
     # id and autonumber avoid collisions for posts containing multiple media items.
     return os.path.join(workdir, "media_%(autonumber)03d_%(id)s.%(ext)s")
@@ -350,41 +364,72 @@ def _download_media(
 ) -> list[str]:
     os.makedirs(workdir, exist_ok=True)
     is_instagram = _is_instagram_url(url)
-    command = [
+    command_base = [
         "yt-dlp", "--ignore-config", "--no-warnings", "--newline",
-        "--retries", "3", "--fragment-retries", "3", "--extractor-retries", "2",
-        "--file-access-retries", "2", "--socket-timeout", "20",
+        "--retries", "2", "--fragment-retries", "2", "--extractor-retries", "1",
+        "--file-access-retries", "2", "--socket-timeout", "15",
         "--concurrent-fragments", "4", "--trim-filenames", "100",
         "--remote-components", "ejs:github",
         "-o", _media_template(workdir),
     ]
-    command += _cookie_args(workdir, instagram=is_instagram)
+    # Instagram is attempted anonymously for public posts. Do not ask for or load
+    # Instagram cookies; the extractor's public-access path is best-effort only.
     if not is_instagram:
-        command.append("--no-playlist")
+        command_base += _cookie_args(workdir)
+    if not is_instagram:
+        command_base.append("--no-playlist")
     else:
-        # Instagram gallery posts are extractor playlists; retain item order and cap work.
-        command += ["--yes-playlist", "--playlist-end", str(MAX_PLAYLIST)]
+        # Public galleries are extractor playlists; keep a strict item cap and ordering.
+        command_base += ["--yes-playlist", "--playlist-end", str(MAX_PLAYLIST)]
     if progress is not None:
-        command += [
+        command_base += [
             "--progress-template",
             "download:PROGRESS|%(progress._percent_str)s|%(progress._speed_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s",
         ]
     if subtitles:
-        command += ["--write-subs", "--write-auto-subs", "--sub-langs", "en,hi",
-                    "--convert-subs", "srt", "--skip-download", "--no-warnings"]
+        command_base += ["--write-subs", "--write-auto-subs", "--sub-langs", "en,hi",
+                         "--convert-subs", "srt", "--skip-download"]
     elif mp3:
-        # yt-dlp embeds source title/artist/uploader metadata into the converted MP3.
-        command += [
+        command_base += [
             "-x", "--audio-format", "mp3", "--audio-quality", "0",
-            # If source music metadata lacks an artist, keep the channel/uploader as a useful fallback.
             "--parse-metadata", "%(uploader|)s:%(meta_artist)s", "--embed-metadata",
         ]
-    else:
-        if fmt and fmt != "best":
-            command += ["-f", fmt]
+    elif fmt and fmt != "best":
+        command_base += ["-f", fmt]
+    # Ensure DASH MP4+M4A merges produce an MP4 container, but codec normalization
+    # below remains authoritative for Telegram playback compatibility.
+    if not mp3 and not subtitles and not is_instagram:
+        command_base += ["--merge-output-format", "mp4"]
 
-    command.append(url)
-    return_code, tail = _run_streaming_command(command, DOWNLOAD_TIMEOUT if not subtitles else 300, progress)
+    candidates = _instagram_url_candidates(url) if is_instagram else [url]
+    return_code = 1
+    tail: list[str] = []
+    for candidate_index, candidate in enumerate(candidates):
+        if candidate_index:
+            # A failed first Instagram extraction may leave fragments behind; do not
+            # accidentally treat partial files as a successful retry's result.
+            for name in os.listdir(workdir):
+                if name.startswith("media_") or name.endswith((".part", ".ytdl")):
+                    try:
+                        os.remove(os.path.join(workdir, name))
+                    except OSError:
+                        pass
+        command = command_base + [candidate]
+        if progress is not None:
+            progress["stage"] = "Downloading"
+        # Instagram is tried at most twice with no required cookies; each attempt is
+        # bounded so a login wall/rate-limit cannot stall the job for 20 minutes.
+        timeout = min(DOWNLOAD_TIMEOUT, 150) if is_instagram else (DOWNLOAD_TIMEOUT if not subtitles else 240)
+        try:
+            return_code, tail = _run_streaming_command(command, timeout, progress)
+        except TimeoutError as exc:
+            if not is_instagram or candidate_index == len(candidates) - 1:
+                raise
+            return_code, tail = 124, [str(exc)]
+        if return_code == 0:
+            break
+        if not is_instagram or candidate_index == len(candidates) - 1:
+            raise RuntimeError(_clean_ytdlp_error(tail))
     if return_code != 0:
         raise RuntimeError(_clean_ytdlp_error(tail))
 
@@ -397,14 +442,12 @@ def _download_media(
     files = sorted(files)
     if not files:
         raise RuntimeError(_clean_ytdlp_error(tail) or "No media files were produced.")
-    # Enforce a disk safety ceiling after download.
     for path in files:
         if os.path.getsize(path) > MAX_SOURCE_BYTES:
             raise RuntimeError(
                 f"The source file exceeds the configured {MAX_SOURCE_BYTES // 1048576} MiB safety limit."
             )
     return files
-
 
 def _download_youtube_thumbnail(url: str, root_dir: str) -> str | None:
     """Fetch an image from a YouTube thumbnail CDN and normalize it to a small JPEG.
@@ -454,7 +497,7 @@ def _get_video_meta(url: str) -> dict[str, Any] | None:
     with tempfile.TemporaryDirectory(prefix="dlmeta_", dir=WORK_DIR) as td:
         command = ["yt-dlp", "--ignore-config", "--dump-single-json", "--no-playlist", "--skip-download",
                    "--no-warnings", "--remote-components", "ejs:github"]
-        command += _cookie_args(td, instagram=_is_instagram_url(url))
+        command += _cookie_args(td)
         command.append(url)
         try:
             result = _run_capture(command, 90)
@@ -483,28 +526,30 @@ def _get_video_meta(url: str) -> dict[str, Any] | None:
             return None
 
 
+def _quality_selector(height: int) -> str:
+    """Prefer natively playable AVC/AAC MP4 streams; retain safe format fallbacks."""
+    h = max(144, min(int(height), 1080))
+    return (
+        f"bv*[height={h}][ext=mp4][vcodec^=avc1]+ba[ext=m4a][acodec^=mp4a]/"
+        f"b[height={h}][ext=mp4][vcodec^=avc1]/"
+        f"bv*[height={h}][ext=mp4]+ba[ext=m4a]/"
+        f"b[height={h}][ext=mp4]/"
+        f"bv*[height<={h}]+ba/b[height<={h}]"
+    )
+
 def _format_chain(user_id: int, force_fmt: str | None = None) -> list[str]:
     if force_fmt:
-        match = re.search(r"height<=?(\d+)", force_fmt)
+        match = re.search(r"height[<]?=?([0-9]+)", force_fmt)
         max_height = int(match.group(1)) if match else 1080
-        heights = [height for height in [1080, 720, 480, 360] if height <= max_height]
-        selectors = [force_fmt]
-    else:
-        preferred = _user_quality.get(user_id)
-        max_height = preferred or 1080
-        heights = [height for height in [1080, 720, 480, 360] if height <= max_height]
-        selectors = []
-    for height in heights:
-        # Prefer MP4/M4A when offered, then allow another compatible container.
-        selector = (
-            f"bv*[height<={height}][ext=mp4]+ba[ext=m4a]/"
-            f"b[height<={height}][ext=mp4]/"
-            f"bv*[height<={height}]+ba/b[height<={height}]"
-        )
-        if selector not in selectors:
-            selectors.append(selector)
-    # The fallback remains within the selected maximum; it never silently jumps to 4K.
-    selectors.append(f"best[height<={max_height}]")
+        heights = [h for h in [1080, 720, 480, 360] if h < max_height]
+        # Honour the selected menu item first; only step down if its download or
+        # preparation fails. Never retry the same top resolution several times.
+        return list(dict.fromkeys([force_fmt] + [_quality_selector(h) for h in heights]))
+    preferred = _user_quality.get(user_id)
+    max_height = preferred or 1080
+    heights = [h for h in [1080, 720, 480, 360] if h <= max_height]
+    selectors = [_quality_selector(h) for h in heights]
+    selectors.append(f"best[height<={max_height}]" if max_height else "best")
     return list(dict.fromkeys(selectors))
 
 # --------------------------- FFprobe / splitting ---------------------------
@@ -556,12 +601,83 @@ def _run_ffmpeg(command: list[str], timeout: int = FFMPEG_TIMEOUT) -> bool:
         return False
 
 
-def _normalize_video_for_telegram(path: str, root_dir: str, source_index: int) -> str:
-    """Create a streamable MP4 (H.264 + AAC, fast-start) for Telegram video messages.
+def _run_ffmpeg_with_progress(
+    command: list[str], *, timeout: int, progress: dict[str, Any] | None, duration: float
+) -> bool:
+    """Run FFmpeg with machine-readable progress so conversion doesn't look hung."""
+    if not command or len(command) < 2:
+        return False
+    # `output` is the final argument for the generated command; insert progress
+    # output options immediately before it, where FFmpeg's output options apply.
+    monitored = command[:-1] + ["-progress", "pipe:1", "-nostats", command[-1]]
+    try:
+        process = subprocess.Popen(
+            monitored, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            errors="replace", bufsize=1, env=_base_env(),
+            start_new_session=(os.name == "posix"),
+        )
+    except OSError as exc:
+        log.warning("FFmpeg could not start (%s)", type(exc).__name__)
+        return False
 
-    Remux compatible H.264/AAC MP4 files without quality loss; transcode formats such as
-    WebM/VP9/Opus to H.264/AAC. Fail clearly rather than silently sending a generic document.
-    """
+    tail: deque[str] = deque(maxlen=40)
+    def reader() -> None:
+        assert process.stdout is not None
+        current: dict[str, str] = {}
+        for raw_line in process.stdout:
+            line = raw_line.strip()
+            if not line:
+                continue
+            tail.append(line)
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            current[key] = value
+            if key in {"out_time_us", "out_time_ms"} and progress is not None and duration > 0:
+                try:
+                    seconds = int(value) / 1_000_000
+                    pct = max(0.0, min(100.0, seconds * 100.0 / duration))
+                    progress["pct"] = f"{pct:.1f}%"
+                    # Conversion speed is reported separately below, and no fake MiB
+                    # counters are shown for FFmpeg's time-based progress.
+                    progress.pop("done", None)
+                    progress.pop("total", None)
+                except (ValueError, ZeroDivisionError):
+                    pass
+            elif key == "speed" and progress is not None:
+                progress["spd"] = value
+            elif key == "progress":
+                current.clear()
+
+    thread = threading.Thread(target=reader, daemon=True, name="ffmpeg-progress")
+    thread.start()
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    while process.poll() is None:
+        if time.monotonic() >= deadline:
+            timed_out = True
+            _stop_process(process)
+            break
+        time.sleep(0.25)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        _stop_process(process)
+    thread.join(timeout=5)
+    if timed_out:
+        raise TimeoutError(f"FFmpeg conversion exceeded its {timeout}-second time limit")
+    if process.returncode != 0:
+        log.warning("FFmpeg conversion failed: %s", " | ".join(tail)[-300:])
+        return False
+    if progress is not None:
+        progress["pct"] = "100%"
+        progress["spd"] = ""
+    return True
+
+def _normalize_video_for_telegram(
+    path: str, root_dir: str, source_index: int, progress: dict[str, Any] | None = None
+) -> str:
+    """Return streamable H.264/AAC MP4; remux compatible files without re-encoding."""
     info = _probe_media(path)
     if not info.get("has_video") and Path(path).suffix.lower() not in VIDEO_EXTS:
         return path
@@ -576,35 +692,66 @@ def _normalize_video_for_telegram(path: str, root_dir: str, source_index: int) -
     video_codec = str(info.get("video_codec") or "").lower()
     audio_codec = str(info.get("audio_codec") or "").lower()
     has_video = bool(info.get("has_video"))
-    if has_video and Path(path).suffix.lower() == ".mp4" and video_codec == "h264" and audio_codec in {"", "aac"}:
+
+    if progress is not None:
+        progress.update(stage="Preparing video", pct="0%", spd="", done=0, total=0)
+
+    # Case 1: AVC/H.264 + AAC (including streams inside MKV/WebM) can be remuxed
+    # directly to MP4. This is effectively stream-copy speed and avoids the long
+    # CPU transcode that caused small 1080p downloads to stall on Render Free.
+    if has_video and video_codec == "h264" and audio_codec in {"", "aac"}:
         remux = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", path,
             "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-c", "copy",
             "-movflags", "+faststart", "-map_metadata", "0", output,
         ]
-        if _run_ffmpeg(remux) and os.path.isfile(output) and os.path.getsize(output) > 0:
+        if _run_ffmpeg(remux, timeout=min(90, FFMPEG_TIMEOUT)) and os.path.isfile(output) and os.path.getsize(output) > 0:
+            if progress is not None:
+                progress.update(stage="Preparing video", pct="100%", spd="")
             return output
         try:
             os.remove(output)
         except OSError:
             pass
 
-    # Telegram inline playback is most reliable with H.264, yuv420p and AAC.
+    # Case 2: H.264 video but non-AAC audio: preserve video bit-for-bit and convert
+    # only audio, which is far faster than transcoding an entire 1080p video.
+    if has_video and video_codec == "h264" and audio_codec not in {"", "aac"}:
+        audio_fix = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+            "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart", "-map_metadata", "0", output,
+        ]
+        if _run_ffmpeg(audio_fix, timeout=min(FFMPEG_TIMEOUT, 180)) and os.path.isfile(output) and os.path.getsize(output) > 0:
+            final_info = _probe_media(output)
+            if final_info.get("has_video") and final_info.get("video_codec") == "h264":
+                return output
+        try:
+            os.remove(output)
+        except OSError:
+            pass
+
+    # Case 3: VP9/AV1/other source codecs require a full transcode for universal
+    # Telegram inline playback. Ultrafast is chosen deliberately for free-tier CPUs.
     transcode = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", path,
         "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-        "-vf", "scale='min(1920,iw)':-2", "-c:v", "libx264", "-preset", "veryfast",
-        "-crf", "23", "-pix_fmt", "yuv420p", "-threads", "2",
+        "-vf", "scale='min(1920,iw)':-2", "-c:v", "libx264", "-preset", "ultrafast",
+        "-crf", "24", "-pix_fmt", "yuv420p", "-threads", "2",
         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
         "-map_metadata", "0", output,
     ]
-    if not _run_ffmpeg(transcode, timeout=FFMPEG_TIMEOUT) or not os.path.isfile(output) or os.path.getsize(output) <= 0:
+    duration = float(info.get("duration") or 0)
+    ok = _run_ffmpeg_with_progress(transcode, timeout=FFMPEG_TIMEOUT, progress=progress, duration=duration)
+    if not ok or not os.path.isfile(output) or os.path.getsize(output) <= 0:
         try:
             os.remove(output)
         except OSError:
             pass
         raise RuntimeError(
-            f"Could not convert {Path(path).suffix or 'media'} to a playable MP4. Please retry or choose a lower quality."
+            f"Could not convert {Path(path).suffix or 'media'} to a playable MP4 within the CPU time limit. "
+            "Please retry with 720p or Automatic quality."
         )
 
     final_info = _probe_media(output)
@@ -613,7 +760,6 @@ def _normalize_video_for_telegram(path: str, root_dir: str, source_index: int) -
     if final_info.get("has_audio") and final_info.get("audio_codec") != "aac":
         raise RuntimeError("Video audio conversion failed; refusing to send a non-standard video file.")
     return output
-
 
 def _create_video_thumbnail(path: str, root_dir: str, source_index: int, part_index: int) -> str | None:
     """Make a small JPEG preview Telegram can display before the uploaded video is opened."""
@@ -773,7 +919,7 @@ def _split_oversized(
     raise RuntimeError(f"Could not safely split this file: {last_error}")
 
 
-def _prepare_files(paths: list[str], root_dir: str, mp3: bool) -> list[dict[str, Any]]:
+def _prepare_files(paths: list[str], root_dir: str, mp3: bool, progress: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
     source_count = len(paths)
     for source_index, original_path in enumerate(paths, start=1):
@@ -796,7 +942,7 @@ def _prepare_files(paths: list[str], root_dir: str, mp3: bool) -> list[dict[str,
 
         # Convert WebM/non-H.264 media to standard MP4 before delivery.
         if kind == "video":
-            path = _normalize_video_for_telegram(path, root_dir, source_index)
+            path = _normalize_video_for_telegram(path, root_dir, source_index, progress=progress)
         if os.path.getsize(path) <= MAX_UPLOAD_BYTES:
             file_parts = [path]
         elif kind in {"video", "audio"}:
@@ -1064,7 +1210,8 @@ async def _progress_reporter(status, progress: dict[str, Any], stop_event: async
         width = 12
         filled = min(width, max(0, int(percent / 100 * width)))
         bar = "█" * filled + "░" * (width - filled)
-        text = f"Downloading… [{bar}] {percent:.1f}%"
+        stage = str(progress.get("stage") or "Downloading")
+        text = f"{stage}… [{bar}] {percent:.1f}%"
         if progress.get("spd"):
             text += f"\nSpeed: {progress['spd']}"
         done = int(progress.get("done") or 0)
@@ -1099,7 +1246,7 @@ async def _run_pipeline(
         return False
 
     if status is None:
-        status = await reply_text_auto(context, message, 
+        status = await message.reply_text(
             "Fetching subtitles…" if subtitles else "Preparing your MP3…" if mp3 else "Starting download…"
         )
     add_history(uid, url)
@@ -1132,16 +1279,22 @@ async def _run_pipeline(
                     if sent:
                         suffix = " Oversized subtitle files were not sent." if oversized_subtitles else ""
                         await safe_edit(status, f"Finished. Sent {sent} subtitle file(s).{suffix}")
+                        schedule_auto_delete(context, status)
                         return True
                     if oversized_subtitles:
                         await safe_edit(status, "Subtitle files were found, but they exceed the Telegram upload limit.")
+                        schedule_auto_delete(context, status)
                         return False
                     await safe_edit(status, "No subtitles were available in the requested languages.")
+                    schedule_auto_delete(context, status)
                     return False
                 finally:
                     shutil.rmtree(subdir, ignore_errors=True)
 
-            chain = ["best[ext=mp4]/best"] if mp3 else _format_chain(uid, force_fmt)
+            chain = (
+                ["best"] if _is_instagram_url(url) and not subtitles
+                else (["best[ext=mp4]/best"] if mp3 else _format_chain(uid, force_fmt))
+            )
             last_error = "No compatible format was found."
             for index, fmt in enumerate(chain, start=1):
                 attempt_dir = os.path.join(workdir, f"attempt_{index}")
@@ -1149,7 +1302,8 @@ async def _run_pipeline(
                 stop_event = asyncio.Event()
                 reporter = asyncio.create_task(_progress_reporter(status, progress, stop_event))
                 try:
-                    await safe_edit(status, f"Downloading… (quality attempt {index}/{len(chain)})")
+                    progress["stage"] = "Downloading"
+                    await safe_edit(status, f"Downloading… (attempt {index}/{len(chain)})")
                     files = await loop.run_in_executor(
                         pool,
                         lambda d=attempt_dir, f=fmt: _download_media(
@@ -1159,27 +1313,40 @@ async def _run_pipeline(
                 except (RuntimeError, TimeoutError, OSError, subprocess.SubprocessError) as exc:
                     last_error = str(exc)[:240] or type(exc).__name__
                     log.warning("Download attempt %s failed (%s)", index, type(exc).__name__)
-                    shutil.rmtree(attempt_dir, ignore_errors=True)
-                    continue
-                finally:
                     stop_event.set()
                     reporter.cancel()
                     try:
                         await reporter
                     except asyncio.CancelledError:
                         pass
+                    shutil.rmtree(attempt_dir, ignore_errors=True)
+                    continue
 
                 try:
-                    await safe_edit(status, "Download complete. Preparing files for Telegram…")
+                    progress.update(stage="Preparing video", pct="0%", spd="", done=0, total=0)
+                    await safe_edit(status, "Download complete. Preparing a playable video…")
                     prepared = await loop.run_in_executor(
                         pool,
-                        lambda: _prepare_files(files, attempt_dir, mp3),
+                        lambda: _prepare_files(files, attempt_dir, mp3, progress),
                     )
                 except (RuntimeError, TimeoutError, OSError, subprocess.SubprocessError) as exc:
                     last_error = str(exc)[:240] or type(exc).__name__
                     log.warning("Splitting/preparation failed on attempt %s (%s)", index, type(exc).__name__)
+                    stop_event.set()
+                    reporter.cancel()
+                    try:
+                        await reporter
+                    except asyncio.CancelledError:
+                        pass
                     shutil.rmtree(attempt_dir, ignore_errors=True)
                     continue
+                else:
+                    stop_event.set()
+                    reporter.cancel()
+                    try:
+                        await reporter
+                    except asyncio.CancelledError:
+                        pass
 
                 sent = 0
                 total_count = len(prepared)
@@ -1188,6 +1355,7 @@ async def _run_pipeline(
                 part_index = 0
                 while part_index < total_count:
                     item = prepared[part_index]
+                    await safe_edit(status, f"Uploading file {part_index + 1}/{total_count} to Telegram…")
                     # Keep gallery order and send eligible Instagram carousel media as albums.
                     if is_instagram and _album_eligible(item):
                         batch = []
@@ -1223,6 +1391,7 @@ async def _run_pipeline(
                         )
                         await _send_prepared(message, item, caption)
                         sent += 1
+                        await safe_edit(status, f"Uploaded {sent}/{total_count} file(s)…")
                         # Telegram limits repeated messages in one chat; pace multi-part uploads.
                         part_index += 1
                         if part_index < total_count:
@@ -1234,6 +1403,7 @@ async def _run_pipeline(
 
                 if upload_error:
                     await safe_edit(status, f"Downloaded {sent}/{total_count} file(s), but an upload failed ({upload_error}). Please retry.")
+                    schedule_auto_delete(context, status)
                     return False
 
                 counted_sources: set[int] = set()
@@ -1250,25 +1420,24 @@ async def _run_pipeline(
                     bump_stats(uid, source_kind, source_bytes)
                 bump_bundle_stats(uid, sent)
                 await safe_edit(status, f"Done! Sent {sent} file(s) successfully.")
+                schedule_auto_delete(context, status)
                 return True
 
             if _is_instagram_url(url):
                 lowered = last_error.lower()
-                if any(token in lowered for token in ("empty media response", "login", "cookies", "private", "not available")):
-                    if not os.environ.get("INSTAGRAM_COOKIES", "").strip():
-                        last_error = (
-                            "Instagram did not return the media. This reel may require login, be private, "
-                            "or be temporarily blocked. If you own/have permission to save it, add a valid "
-                            "Netscape cookie export as Render secret INSTAGRAM_COOKIES and redeploy; "
-                            "otherwise this post may not be accessible to the bot."
-                        )
-                    else:
-                        last_error = "Instagram did not return media. Check that INSTAGRAM_COOKIES is valid and the post is accessible to your account."
-            await safe_edit(status, f"Download failed after retries: {last_error}")
+                if any(token in lowered for token in ("empty media response", "login", "cookies", "private", "not available", "requested content is not available")):
+                    last_error = (
+                        "Instagram did not expose this reel to anonymous server requests. The bot tried the original and a clean public URL without requiring cookies, but Instagram may be login-gating or rate-limiting this post. "
+                        "Try again later or use a reel that is publicly accessible without signing in; the bot cannot guarantee downloads when Instagram blocks unauthenticated access."
+                    )
+            await safe_edit(status, f"Download failed: {last_error}")
+            schedule_auto_delete(context, status)
             return False
     except Exception as exc:
         log.exception("Unexpected download pipeline failure")
         await safe_edit(status, f"Something went wrong ({type(exc).__name__}). Please try again later.")
+        if status is not None:
+            schedule_auto_delete(context, status)
         return False
 
 
@@ -1362,10 +1531,13 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
         return
     # Source URL messages are temporary too; only bot text is cleaned by the helper below.
     schedule_auto_delete(context, update.effective_message)
-    status = await reply_text_auto(context, update.effective_message, "Reading available video qualities…")
+    status = await update.effective_message.reply_text("Reading available video qualities…")
     meta = await asyncio.get_running_loop().run_in_executor(context.bot_data["pool"], lambda: _get_video_meta(url))
     if not meta:
-        await safe_edit(status, "Could not read quality options. Starting an automatic download instead…")
+        try:
+            await status.delete()
+        except TelegramError:
+            pass
         await download_job(update, context, url)
         return
 
@@ -1373,15 +1545,14 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
     for height in meta["heights"]:
         size = int(meta["sizes"].get(str(height), 0))
         label_size = f" — {size / 1048576:.1f} MiB" if size else ""
-        selector = (
-            f"bv*[height<={height}][ext=mp4]+ba[ext=m4a]/"
-            f"b[height<={height}][ext=mp4]/"
-            f"bv*[height<={height}]+ba/b[height<={height}]"
-        )
+        selector = _quality_selector(height)
         options.append((f"🎬 {height}p{label_size}", selector))
     options += [("🎵 Download MP3", "__MP3__"), ("⚡ Automatic quality", "__AUTO__")]
     if not options:
-        await safe_edit(status, "No quality menu is available. Starting an automatic download…")
+        try:
+            await status.delete()
+        except TelegramError:
+            pass
         await download_job(update, context, url)
         return
 
