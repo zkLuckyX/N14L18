@@ -58,6 +58,10 @@ MAX_PLAYLIST = max(1, min(int(os.environ.get("MAX_PLAYLIST", "10")), 20))
 USER_COOLDOWN = max(0, int(os.environ.get("USER_COOLDOWN_SECONDS", "15")))
 DOWNLOAD_TIMEOUT = max(90, int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "480")))
 FFMPEG_TIMEOUT = max(60, int(os.environ.get("FFMPEG_TIMEOUT_SECONDS", "240")))
+# Full software transcoding on Render Free is expensive. Limit it separately and
+# prefer stream-copy/remux before ever encoding video frames.
+VIDEO_TRANSCODE_TIMEOUT = max(30, min(240, int(os.environ.get("VIDEO_TRANSCODE_TIMEOUT_SECONDS", "120"))))
+VIDEO_TRANSCODE_MAX_HEIGHT = max(360, min(1080, int(os.environ.get("VIDEO_TRANSCODE_MAX_HEIGHT", "720"))))
 AUTO_DELETE_SECONDS = max(60, int(os.environ.get("AUTO_DELETE_SECONDS", "600")))
 MAX_PARTS = 128
 MAX_SPLIT_DEPTH = 8
@@ -79,6 +83,30 @@ logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# httpx logs complete Telegram Bot API request URLs, which include the secret token.
+# Never allow those URLs into application/Render logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+class _SecretRedactionFilter(logging.Filter):
+    """Redact bot tokens even if a third-party exception contains an API URL."""
+    _token_url = re.compile(r"bot[0-9]{5,}:[A-Za-z0-9_-]{20,}")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        message = self._token_url.sub("bot[REDACTED]", message)
+        if TOKEN:
+            message = message.replace(TOKEN, "[REDACTED]")
+        record.msg = message
+        record.args = ()
+        return True
+
+_root_logger = logging.getLogger()
+for _handler in _root_logger.handlers:
+    _handler.addFilter(_SecretRedactionFilter())
 log = logging.getLogger("media-bot")
 
 _STATE_LOCK = threading.RLock()
@@ -372,9 +400,11 @@ def _download_media(
         "--remote-components", "ejs:github",
         "-o", _media_template(workdir),
     ]
-    # Instagram is attempted anonymously for public posts. Do not ask for or load
-    # Instagram cookies; the extractor's public-access path is best-effort only.
-    if not is_instagram:
+    # Instagram is attempted anonymously, with browser TLS/client impersonation when
+    # curl-cffi is installed. This uses no login cookies and is best-effort only.
+    if is_instagram:
+        command_base += ["--impersonate", os.environ.get("INSTAGRAM_IMPERSONATE", "chrome")]
+    else:
         command_base += _cookie_args(workdir)
     if not is_instagram:
         command_base.append("--no-playlist")
@@ -527,13 +557,19 @@ def _get_video_meta(url: str) -> dict[str, Any] | None:
 
 
 def _quality_selector(height: int) -> str:
-    """Prefer natively playable AVC/AAC MP4 streams; retain safe format fallbacks."""
+    """Prefer Telegram-friendly H.264/AAC before a potentially expensive transcode.
+
+    The requested height is a ceiling: if 1080p is only available as VP9/AV1,
+    prefer an available lower-resolution AVC stream over forcing a slow transcode.
+    """
     h = max(144, min(int(height), 1080))
     return (
         f"bv*[height={h}][ext=mp4][vcodec^=avc1]+ba[ext=m4a][acodec^=mp4a]/"
         f"b[height={h}][ext=mp4][vcodec^=avc1]/"
-        f"bv*[height={h}][ext=mp4]+ba[ext=m4a]/"
-        f"b[height={h}][ext=mp4]/"
+        f"bv*[height<={h}][ext=mp4][vcodec^=avc1]+ba[ext=m4a][acodec^=mp4a]/"
+        f"b[height<={h}][ext=mp4][vcodec^=avc1]/"
+        f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/"
+        f"b[height<={h}][ext=mp4]/"
         f"bv*[height<={h}]+ba/b[height<={h}]"
     )
 
@@ -677,35 +713,59 @@ def _run_ffmpeg_with_progress(
 def _normalize_video_for_telegram(
     path: str, root_dir: str, source_index: int, progress: dict[str, Any] | None = None
 ) -> str:
-    """Return streamable H.264/AAC MP4; remux compatible files without re-encoding."""
+    """Prefer fast H.264/AAC MP4 remux; bound transcoding and never discard a valid source.
+
+    Full video transcoding is the last resort. If it cannot complete within the short
+    Render-friendly deadline, return a source file that fits Telegram's upload cap:
+    MP4 is still sent as a video; other containers are delivered as documents rather
+    than making the user wait through repeated 4-minute transcodes with no result.
+    """
     info = _probe_media(path)
-    if not info.get("has_video") and Path(path).suffix.lower() not in VIDEO_EXTS:
+    ext = Path(path).suffix.lower()
+    size = os.path.getsize(path) if os.path.isfile(path) else 0
+    has_video = bool(info.get("has_video"))
+    if not has_video and ext not in VIDEO_EXTS:
         return path
 
     os.makedirs(root_dir, exist_ok=True)
     output = os.path.join(root_dir, f"streamable_{source_index:03d}.mp4")
     try:
         os.remove(output)
-    except FileNotFoundError:
+    except OSError:
         pass
 
     video_codec = str(info.get("video_codec") or "").lower()
     audio_codec = str(info.get("audio_codec") or "").lower()
-    has_video = bool(info.get("has_video"))
-
+    duration = float(info.get("duration") or 0)
     if progress is not None:
         progress.update(stage="Preparing video", pct="0%", spd="", done=0, total=0)
 
-    # Case 1: AVC/H.264 + AAC (including streams inside MKV/WebM) can be remuxed
-    # directly to MP4. This is effectively stream-copy speed and avoids the long
-    # CPU transcode that caused small 1080p downloads to stall on Render Free.
+    def original_fallback(reason: str) -> str:
+        if size > 0:
+            log.warning("Using original media fallback for %s (%s)", Path(path).name, reason)
+            if progress is not None:
+                progress.update(stage="Using original file", pct="100%", spd="")
+            # Oversized sources continue into the normal splitting pipeline below.
+            return path
+        raise RuntimeError(f"Video conversion failed ({reason}) and the source file is empty or missing.")
+
+    # If the probe fails on an MP4, do not burn CPU attempting a blind full transcode.
+    # Send the file as a video and let Telegram/client playback determine compatibility.
+    if not info:
+        if ext == ".mp4":
+            return original_fallback("media metadata could not be read")
+        log.warning("FFprobe metadata unavailable for %s; attempting bounded conversion", Path(path).name)
+
+    # AVC/H.264 + AAC can be remuxed in seconds without decoding video frames.
+    # Even an MP4 source goes through this stream-copy step so +faststart is set for
+    # Telegram streaming; this is not a re-encode and should be much faster than decode/encode.
     if has_video and video_codec == "h264" and audio_codec in {"", "aac"}:
         remux = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", path,
             "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-c", "copy",
             "-movflags", "+faststart", "-map_metadata", "0", output,
         ]
-        if _run_ffmpeg(remux, timeout=min(90, FFMPEG_TIMEOUT)) and os.path.isfile(output) and os.path.getsize(output) > 0:
+        if _run_ffmpeg(remux, timeout=min(60, FFMPEG_TIMEOUT)) and os.path.isfile(output) and os.path.getsize(output) > 0:
             if progress is not None:
                 progress.update(stage="Preparing video", pct="100%", spd="")
             return output
@@ -713,17 +773,19 @@ def _normalize_video_for_telegram(
             os.remove(output)
         except OSError:
             pass
+        # A valid MP4 source is safer than following a failed stream-copy with a 4-minute transcode.
+        if ext == ".mp4":
+            return original_fallback("fast remux failed")
 
-    # Case 2: H.264 video but non-AAC audio: preserve video bit-for-bit and convert
-    # only audio, which is far faster than transcoding an entire 1080p video.
+    # Preserve H.264 video bit-for-bit when only the audio codec needs conversion.
     if has_video and video_codec == "h264" and audio_codec not in {"", "aac"}:
         audio_fix = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", path,
             "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
             "-movflags", "+faststart", "-map_metadata", "0", output,
         ]
-        if _run_ffmpeg(audio_fix, timeout=min(FFMPEG_TIMEOUT, 180)) and os.path.isfile(output) and os.path.getsize(output) > 0:
+        if _run_ffmpeg(audio_fix, timeout=min(90, FFMPEG_TIMEOUT)) and os.path.isfile(output) and os.path.getsize(output) > 0:
             final_info = _probe_media(output)
             if final_info.get("has_video") and final_info.get("video_codec") == "h264":
                 return output
@@ -731,34 +793,54 @@ def _normalize_video_for_telegram(
             os.remove(output)
         except OSError:
             pass
+        if ext == ".mp4":
+            return original_fallback("audio conversion failed")
 
-    # Case 3: VP9/AV1/other source codecs require a full transcode for universal
-    # Telegram inline playback. Ultrafast is chosen deliberately for free-tier CPUs.
+    # True last resort: transcode to a maximum 720p H.264/AAC MP4. This is far faster
+    # on a free-tier CPU than trying to preserve 1080p VP9/AV1. Already-compatible
+    # 1080p sources bypass this branch entirely.
+    max_h = VIDEO_TRANSCODE_MAX_HEIGHT
+    max_w = int(round(max_h * 16 / 9))
     transcode = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", path,
         "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-        "-vf", "scale='min(1920,iw)':-2", "-c:v", "libx264", "-preset", "ultrafast",
-        "-crf", "24", "-pix_fmt", "yuv420p", "-threads", "2",
-        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+        "-vf", f"scale=w='min({max_w},iw)':h='min({max_h},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "25", "-pix_fmt", "yuv420p",
+        "-threads", "2", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
         "-map_metadata", "0", output,
     ]
-    duration = float(info.get("duration") or 0)
-    ok = _run_ffmpeg_with_progress(transcode, timeout=FFMPEG_TIMEOUT, progress=progress, duration=duration)
+    try:
+        ok = _run_ffmpeg_with_progress(
+            transcode, timeout=VIDEO_TRANSCODE_TIMEOUT, progress=progress, duration=duration
+        )
+    except TimeoutError as exc:
+        log.warning("Video transcode deadline reached for %s", Path(path).name)
+        try:
+            os.remove(output)
+        except OSError:
+            pass
+        return original_fallback(str(exc))
+
     if not ok or not os.path.isfile(output) or os.path.getsize(output) <= 0:
         try:
             os.remove(output)
         except OSError:
             pass
-        raise RuntimeError(
-            f"Could not convert {Path(path).suffix or 'media'} to a playable MP4 within the CPU time limit. "
-            "Please retry with 720p or Automatic quality."
-        )
+        return original_fallback("H.264/AAC transcode did not complete")
 
     final_info = _probe_media(output)
     if not final_info.get("has_video") or final_info.get("video_codec") != "h264":
-        raise RuntimeError("Video conversion did not produce a valid H.264 MP4; refusing to send an unplayable file.")
+        try:
+            os.remove(output)
+        except OSError:
+            pass
+        return original_fallback("transcode output was not valid H.264 video")
     if final_info.get("has_audio") and final_info.get("audio_codec") != "aac":
-        raise RuntimeError("Video audio conversion failed; refusing to send a non-standard video file.")
+        try:
+            os.remove(output)
+        except OSError:
+            pass
+        return original_fallback("transcode output audio was not AAC")
     return output
 
 def _create_video_thumbnail(path: str, root_dir: str, source_index: int, part_index: int) -> str | None:
@@ -940,9 +1022,18 @@ def _prepare_files(paths: list[str], root_dir: str, mp3: bool, progress: dict[st
         else:
             kind = "document"
 
-        # Convert WebM/non-H.264 media to standard MP4 before delivery.
+        # Convert when fast remux is possible; if transcode is too expensive, the
+        # normalizer keeps a deliverable original instead of silently losing the result.
         if kind == "video":
             path = _normalize_video_for_telegram(path, root_dir, source_index, progress=progress)
+        output_info = _probe_media(path)
+        output_ext = Path(path).suffix.lower()
+        streamable_mp4 = (
+            output_ext == ".mp4" and output_info.get("has_video")
+            and output_info.get("video_codec") == "h264"
+            and output_info.get("audio_codec") in {"", "aac"}
+        )
+        conversion_fallback = kind == "video" and not streamable_mp4
         if os.path.getsize(path) <= MAX_UPLOAD_BYTES:
             file_parts = [path]
         elif kind in {"video", "audio"}:
@@ -966,6 +1057,7 @@ def _prepare_files(paths: list[str], root_dir: str, mp3: bool, progress: dict[st
                 "title": str(pinfo.get("title") or Path(original_path).stem)[:200],
                 "artist": str(pinfo.get("artist") or "")[:100],
                 "thumbnail": thumbnail,
+                "conversion_fallback": conversion_fallback,
                 "source_index": source_index, "source_count": source_count,
                 "part_index": part_index, "part_count": len(file_parts),
                 "source_bytes": original_size,
@@ -1292,7 +1384,7 @@ async def _run_pipeline(
                     shutil.rmtree(subdir, ignore_errors=True)
 
             chain = (
-                ["best"] if _is_instagram_url(url) and not subtitles
+                ["best[ext=mp4]/best"] if _is_instagram_url(url) and not subtitles
                 else (["best[ext=mp4]/best"] if mp3 else _format_chain(uid, force_fmt))
             )
             last_error = "No compatible format was found."
@@ -1382,6 +1474,10 @@ async def _run_pipeline(
                         caption = f"Media {item['source_index']}/{item['source_count']} — Part {item['part_index']}/{item['part_count']}"
                     elif item["source_count"] > 1:
                         caption = f"Media {item['source_index']}/{item['source_count']}"
+                    elif item.get("conversion_fallback"):
+                        caption = "Downloaded successfully — original format (playback support depends on your app)"
+                    elif item.get("video") and item.get("height"):
+                        caption = f"Downloaded successfully · {int(item['height'])}p"
                     else:
                         caption = "Downloaded successfully"
                     try:
@@ -1573,6 +1669,7 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
     caption = f"<b>{title}</b>"
     if duration:
         caption += f"\nDuration: {duration // 60}:{duration % 60:02d}"
+    caption += "\nQuality buttons select a maximum resolution; compatible H.264 streams are preferred for faster playback."
     try:
         await status.delete()
     except TelegramError:
@@ -1898,12 +1995,27 @@ async def post_init(app: Application) -> None:
     ])
     BOT_READY = True
     LAST_TELEGRAM_OK = time.monotonic()
-    app.create_task(_telegram_heartbeat(app), name="telegram-heartbeat")
+    # post_init runs before Application.start(); use a regular asyncio task and
+    # cancel/await it in post_stop to avoid PTB's not-yet-running task warning.
+    app.bot_data["heartbeat_task"] = asyncio.create_task(
+        _telegram_heartbeat(app), name="telegram-heartbeat"
+    )
     log.info("Telegram commands registered")
 
 
+async def post_stop(app: Application) -> None:
+    task = app.bot_data.pop("heartbeat_task", None)
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 def build_application() -> Application:
-    app = Application.builder().token(TOKEN).concurrent_updates(4).post_init(post_init).build()
+    app = (Application.builder().token(TOKEN).concurrent_updates(4)
+           .post_init(post_init).post_stop(post_stop).build())
     app.bot_data["pool"] = ThreadPoolExecutor(max_workers=2, thread_name_prefix="media-worker")
     app.bot_data["download_semaphore"] = asyncio.Semaphore(1)
     app.add_handler(CommandHandler("start", start))
@@ -1922,7 +2034,14 @@ def build_application() -> Application:
 
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         error = context.error
-        log.error("Telegram handler error: %s", type(error).__name__ if error else "unknown")
+        error_type = type(error).__name__ if error else "unknown"
+        if error_type == "Conflict":
+            log.critical(
+                "Telegram polling conflict: another process/service is using this bot token. "
+                "Keep exactly one active polling instance and rotate the token if it was exposed."
+            )
+        else:
+            log.error("Telegram handler error: %s", error_type)
     app.add_error_handler(on_error)
     return app
 
