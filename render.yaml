@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: pro-video-downloader-bot
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /healthz
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MAX_UPLOAD_MIB
+        value: "45"
+      - key: MAX_SOURCE_MIB
+        value: "1024"
+      - key: MAX_PLAYLIST
+        value: "10"
+      - key: USER_COOLDOWN_SECONDS
+        value: "15"
+      - key: AUTO_DELETE_SECONDS
+        value: "600"
