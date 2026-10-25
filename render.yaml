@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: pro-video-downloader-bot
+    name: naba-lucky-media-bot
     runtime: docker
     plan: free
     dockerfilePath: ./Dockerfile
@@ -9,6 +9,8 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
+      - key: TELEGRAM_MODE
+        value: webhook
       - key: MAX_UPLOAD_MIB
         value: "45"
       - key: MAX_SOURCE_MIB

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import html
+import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -56,7 +58,7 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MIB", "45")) * 1024 * 1024
 MAX_SOURCE_BYTES = int(os.environ.get("MAX_SOURCE_MIB", "1024")) * 1024 * 1024
 MAX_PLAYLIST = max(1, min(int(os.environ.get("MAX_PLAYLIST", "10")), 20))
 MAX_BATCH_LINKS = max(1, min(int(os.environ.get("MAX_BATCH_LINKS", "10")), 20))
-BOT_VERSION = "v10-sequential-queue"
+BOT_VERSION = "v12.1-reviewed-auto-delete"
 USER_COOLDOWN = max(0, int(os.environ.get("USER_COOLDOWN_SECONDS", "15")))
 DOWNLOAD_TIMEOUT = max(90, int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "480")))
 FFMPEG_TIMEOUT = max(60, int(os.environ.get("FFMPEG_TIMEOUT_SECONDS", "240")))
@@ -68,6 +70,26 @@ AUTO_DELETE_SECONDS = max(60, int(os.environ.get("AUTO_DELETE_SECONDS", "600")))
 MAX_PARTS = 128
 MAX_SPLIT_DEPTH = 8
 WORK_DIR = os.environ.get("WORK_DIR", "/tmp")
+# Pending message deletions survive an in-process restart when this state file survives.
+# Render Free storage is ephemeral across instance replacement/redeploy.
+AUTO_DELETE_STATE_FILE = os.environ.get("AUTO_DELETE_STATE_FILE", os.path.join(WORK_DIR, "dlbot_auto_delete.json"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+# Render Free web services sleep without inbound HTTP traffic. Webhook mode is the
+# Render default; local environments without a Render URL continue to use polling.
+TELEGRAM_MODE = os.environ.get(
+    "TELEGRAM_MODE", "webhook" if os.environ.get("RENDER_EXTERNAL_URL") else "polling"
+).strip().lower()
+WEBHOOK_BASE_URL = (os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+WEBHOOK_PATH = "/" + os.environ.get("TELEGRAM_WEBHOOK_PATH", "telegram").strip("/")
+WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
+if not WEBHOOK_SECRET:
+    # Keeps first-time Render deployment simple while deriving an unguessable header
+    # secret from the already-secret bot token. An explicit independent secret is preferred.
+    WEBHOOK_SECRET = hashlib.sha256((TOKEN + ":nabalucky-webhook").encode("utf-8")).hexdigest()
+if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", WEBHOOK_SECRET):
+    raise RuntimeError("TELEGRAM_WEBHOOK_SECRET must contain only letters, digits, '_' or '-' (max 256 chars).")
+if TELEGRAM_MODE not in {"polling", "webhook"}:
+    raise RuntimeError("TELEGRAM_MODE must be either 'polling' or 'webhook'.")
 STATS_FILE = os.environ.get("STATS_FILE", "/tmp/dlbot_stats.json")
 HISTORY_FILE = os.environ.get("HISTORY_FILE", "/tmp/dlbot_history.json")
 ADMIN_IDS = {
@@ -117,6 +139,11 @@ _user_quality: dict[int, int | None] = {}
 _active_users: set[int] = set()
 _PENDING: dict[str, dict[str, Any]] = {}
 _DELETE_TASKS: dict[tuple[int, int], asyncio.Task] = {}
+_DELETE_DUE: dict[tuple[int, int], float] = {}
+_DELETE_STATE_LOCK = threading.RLock()
+_DELETE_DB_LOCK = threading.RLock()
+_DELETE_DB_READY = False
+_DELETE_DB_NEXT_RETRY = 0.0
 BOT_STARTED = False
 BOT_READY = False
 LAST_TELEGRAM_OK = 0.0
@@ -1314,37 +1341,279 @@ def _prepare_files(paths: list[str], root_dir: str, mp3: bool, progress: dict[st
     return prepared
 
 # --------------------------- Telegram sending ---------------------------
-async def _delete_after_delay(message, delay_seconds: int, key: tuple[int, int]) -> None:
-    try:
-        await asyncio.sleep(delay_seconds)
+def _init_delete_db() -> bool:
+    """Initialize optional durable auto-delete storage (Render Postgres via DATABASE_URL)."""
+    global _DELETE_DB_READY, _DELETE_DB_NEXT_RETRY
+    if not DATABASE_URL:
+        return False
+    with _DELETE_DB_LOCK:
+        if _DELETE_DB_READY:
+            return True
+        if time.monotonic() < _DELETE_DB_NEXT_RETRY:
+            return False
         try:
-            await message.delete()
-            log.debug("Auto-deleted message chat=%s id=%s", message.chat_id, message.message_id)
-        except (BadRequest, TelegramError) as exc:
-            # Message may have been manually deleted or chat permissions may prevent deletion.
-            log.debug("Auto-delete skipped chat=%s id=%s (%s)",
-                      getattr(message, "chat_id", "?"), getattr(message, "message_id", "?"), type(exc).__name__)
+            import psycopg
+            with psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS bot_pending_auto_delete ("
+                    "chat_id BIGINT NOT NULL, message_id BIGINT NOT NULL, "
+                    "due_at DOUBLE PRECISION NOT NULL, "
+                    "PRIMARY KEY (chat_id, message_id))"
+                )
+            _DELETE_DB_READY = True
+            _DELETE_DB_NEXT_RETRY = 0.0
+            log.info("Auto-delete persistent database enabled")
+            return True
         except Exception as exc:
-            log.warning("Unexpected auto-delete error (%s)", type(exc).__name__)
-    finally:
-        _DELETE_TASKS.pop(key, None)
+            _DELETE_DB_READY = False
+            _DELETE_DB_NEXT_RETRY = time.monotonic() + 60.0
+            log.warning("Auto-delete database unavailable (%s); retrying in about 60 seconds", type(exc).__name__)
+            return False
 
 
-def schedule_auto_delete(context: ContextTypes.DEFAULT_TYPE, message, delay_seconds: int | None = None) -> None:
-    """Schedule deletion of a text/menu/source-link message, never a media upload."""
-    delay = AUTO_DELETE_SECONDS if delay_seconds is None else max(1, int(delay_seconds))
+
+def _mark_delete_db_unavailable() -> None:
+    global _DELETE_DB_READY, _DELETE_DB_NEXT_RETRY
+    with _DELETE_DB_LOCK:
+        _DELETE_DB_READY = False
+        _DELETE_DB_NEXT_RETRY = time.monotonic() + 60.0
+
+def _upsert_delete_db(key: tuple[int, int], due_at: float) -> None:
+    if not _DELETE_DB_READY:
+        return
     try:
-        key = (int(message.chat_id), int(message.message_id))
-        existing = _DELETE_TASKS.get(key)
-        if existing is not None and not existing.done():
-            return
-        task = context.application.create_task(
-            _delete_after_delay(message, delay, key),
-            name=f"auto-delete-{message.message_id}"
+        import psycopg
+        with psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+            conn.execute(
+                "INSERT INTO bot_pending_auto_delete (chat_id, message_id, due_at) "
+                "VALUES (%s, %s, %s) ON CONFLICT (chat_id, message_id) "
+                "DO UPDATE SET due_at = EXCLUDED.due_at",
+                (key[0], key[1], float(due_at)),
+            )
+    except Exception as exc:
+        _mark_delete_db_unavailable()
+        log.warning("Could not save auto-delete to database chat=%s message_id=%s (%s)",
+                    key[0], key[1], type(exc).__name__)
+
+
+def _delete_from_db(key: tuple[int, int]) -> None:
+    if not _DELETE_DB_READY:
+        return
+    try:
+        import psycopg
+        with psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+            conn.execute(
+                "DELETE FROM bot_pending_auto_delete WHERE chat_id = %s AND message_id = %s",
+                (key[0], key[1]),
+            )
+    except Exception as exc:
+        _mark_delete_db_unavailable()
+        log.warning("Could not clear auto-delete from database chat=%s message_id=%s (%s)",
+                    key[0], key[1], type(exc).__name__)
+
+
+def _read_delete_db() -> list[tuple[tuple[int, int], float]]:
+    if not _DELETE_DB_READY:
+        return []
+    try:
+        import psycopg
+        with psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+            rows = conn.execute(
+                "SELECT chat_id, message_id, due_at FROM bot_pending_auto_delete"
+            ).fetchall()
+        return [((int(chat_id), int(message_id)), float(due_at))
+                for chat_id, message_id, due_at in rows]
+    except Exception as exc:
+        _mark_delete_db_unavailable()
+        log.warning("Could not read auto-delete database state (%s)", type(exc).__name__)
+        return []
+
+
+def _write_delete_state_locked() -> None:
+    """Atomically persist due times so timers can be restored after a process restart."""
+    state_path = Path(AUTO_DELETE_STATE_FILE)
+    tmp_path = state_path.with_name(state_path.name + ".tmp")
+    payload = [
+        {"chat_id": chat_id, "message_id": message_id, "due_at": due_at}
+        for (chat_id, message_id), due_at in _DELETE_DUE.items()
+    ]
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        with tmp_path.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, separators=(",", ":"))
+        os.replace(tmp_path, state_path)
+    except OSError as exc:
+        log.warning("Could not persist auto-delete state at %s (%s)", state_path, type(exc).__name__)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _remember_delete(key: tuple[int, int], due_at: float) -> None:
+    with _DELETE_STATE_LOCK:
+        _DELETE_DUE[key] = float(due_at)
+        _write_delete_state_locked()
+    _upsert_delete_db(key, due_at)
+
+
+def _forget_delete(key: tuple[int, int]) -> None:
+    with _DELETE_STATE_LOCK:
+        _DELETE_DUE.pop(key, None)
+        _write_delete_state_locked()
+    _delete_from_db(key)
+
+
+async def _delete_message_after_due(bot, chat_id: int, message_id: int, due_at: float,
+                                    key: tuple[int, int]) -> None:
+    """Delete by IDs, retry transient network errors, and log results at INFO/WARNING."""
+    try:
+        await asyncio.sleep(max(0.0, due_at - time.time()))
+        while True:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                log.info("Auto-delete succeeded chat=%s message_id=%s", chat_id, message_id)
+                _forget_delete(key)
+                return
+            except BadRequest as exc:
+                detail = str(exc).lower()
+                # If it is already gone, cleanup succeeded from the user's perspective.
+                if "message to delete not found" in detail or "message_id_invalid" in detail:
+                    log.info("Auto-delete already complete chat=%s message_id=%s", chat_id, message_id)
+                else:
+                    log.warning("Telegram rejected auto-delete chat=%s message_id=%s reason=%s",
+                                chat_id, message_id, str(exc)[:180])
+                _forget_delete(key)
+                return
+            except RetryAfter as exc:
+                wait = max(1.0, float(getattr(exc, "retry_after", 1)) + 1.0)
+                log.warning("Auto-delete rate-limited chat=%s message_id=%s; retrying in %.1fs",
+                            chat_id, message_id, wait)
+                await asyncio.sleep(wait)
+            except (NetworkError, TimedOut) as exc:
+                log.warning("Auto-delete network error chat=%s message_id=%s (%s); retrying in 30s",
+                            chat_id, message_id, type(exc).__name__)
+                await asyncio.sleep(30)
+            except TelegramError as exc:
+                log.warning("Telegram auto-delete failed chat=%s message_id=%s (%s)",
+                            chat_id, message_id, type(exc).__name__)
+                _forget_delete(key)
+                return
+            except Exception as exc:
+                log.exception("Unexpected auto-delete failure chat=%s message_id=%s (%s)",
+                              chat_id, message_id, type(exc).__name__)
+                await asyncio.sleep(60)
+    finally:
+        current = asyncio.current_task()
+        # A timer may have been reset while the old task was being cancelled.
+        # Never let the old task remove the newer task for this message.
+        if _DELETE_TASKS.get(key) is current:
+            _DELETE_TASKS.pop(key, None)
+
+
+def _recover_pending_auto_deletes(app: Application) -> None:
+    """Restore pending cleanups from Postgres, falling back to local state when configured."""
+    _init_delete_db()
+    state_path = Path(AUTO_DELETE_STATE_FILE)
+    try:
+        with _DELETE_STATE_LOCK:
+            if state_path.exists():
+                raw = json.loads(state_path.read_text(encoding="utf-8"))
+                if not isinstance(raw, list):
+                    raise ValueError("state root is not a list")
+                for item in raw:
+                    try:
+                        key = (int(item["chat_id"]), int(item["message_id"]))
+                        due_at = float(item["due_at"])
+                        _DELETE_DUE[key] = min(_DELETE_DUE.get(key, due_at), due_at)
+                    except (KeyError, TypeError, ValueError):
+                        log.warning("Ignoring malformed auto-delete state entry")
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        log.warning("Could not read auto-delete state at %s (%s)", state_path, type(exc).__name__)
+
+    for key, due_at in _read_delete_db():
+        with _DELETE_STATE_LOCK:
+            _DELETE_DUE[key] = min(_DELETE_DUE.get(key, due_at), due_at)
+
+    with _DELETE_STATE_LOCK:
+        _write_delete_state_locked()
+        entries = list(_DELETE_DUE.items())
+    # Mirror merged local/DB entries so an old local-only entry also survives the next restart.
+    for key, due_at in entries:
+        _upsert_delete_db(key, due_at)
+
+    if not entries:
+        log.info("Auto-delete recovery: no pending messages found")
+        return
+    log.info("Auto-delete recovery: restoring %d pending message(s)", len(entries))
+    for key, due_at in entries:
+        if key in _DELETE_TASKS and not _DELETE_TASKS[key].done():
+            continue
+        chat_id, message_id = key
+        task = asyncio.create_task(
+            _delete_message_after_due(app.bot, chat_id, message_id, due_at, key),
+            name=f"auto-delete-recovered-{message_id}"
         )
         _DELETE_TASKS[key] = task
+
+
+def _schedule_auto_delete_for_ids(
+    bot,
+    chat_id: int,
+    message_id: int,
+    delay_seconds: int | None = None,
+    *,
+    reset: bool = False,
+) -> None:
+    """Schedule one text/message deletion by IDs; media uploads are never passed here."""
+    delay = AUTO_DELETE_SECONDS if delay_seconds is None else max(1, int(delay_seconds))
+    key = (int(chat_id), int(message_id))
+    existing = _DELETE_TASKS.get(key)
+    if existing is not None and not existing.done():
+        if not reset:
+            return
+        existing.cancel()
+    due_at = time.time() + delay
+    _remember_delete(key, due_at)
+    task = asyncio.create_task(
+        _delete_message_after_due(bot, key[0], key[1], due_at, key),
+        name=f"auto-delete-{message_id}"
+    )
+    _DELETE_TASKS[key] = task
+    log.info("Auto-delete scheduled chat=%s message_id=%s in %ss", key[0], message_id, delay)
+
+
+def schedule_auto_delete(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    delay_seconds: int | None = None,
+    *,
+    reset: bool = False,
+) -> None:
+    """Schedule durable deletion of text/menu/source-link messages, never media uploads.
+
+    Timer tasks are deliberately not registered with Application.create_task(): PTB waits
+    for such tasks during shutdown, but these timers may sleep for ten minutes. We manage
+    them explicitly and cancel them in post_stop while leaving their due times persisted.
+    """
+    try:
+        _schedule_auto_delete_for_ids(
+            context.bot, int(message.chat_id), int(message.message_id), delay_seconds, reset=reset
+        )
     except Exception as exc:
         log.warning("Could not schedule message cleanup (%s)", type(exc).__name__)
+
+
+def cancel_auto_delete(message) -> None:
+    """Forget a pending deletion when a temporary message was deleted manually."""
+    try:
+        key = (int(message.chat_id), int(message.message_id))
+        task = _DELETE_TASKS.get(key)
+        if task is not None and not task.done():
+            task.cancel()
+        _forget_delete(key)
+    except Exception as exc:
+        log.debug("Could not cancel auto-delete timer (%s)", type(exc).__name__)
 
 
 async def reply_text_auto(context: ContextTypes.DEFAULT_TYPE, message, text: str, *args, **kwargs):
@@ -1357,11 +1626,20 @@ async def reply_text_auto(context: ContextTypes.DEFAULT_TYPE, message, text: str
 async def safe_edit(message, text: str) -> None:
     try:
         await message.edit_text(text)
+        # Progress/status messages must not expire while they are still being updated.
+        # Every successful edit renews its TTL; terminal paths set it to 10 minutes again.
+        key = (int(message.chat_id), int(message.message_id))
+        if key in _DELETE_DUE:
+            _schedule_auto_delete_for_ids(
+                message.get_bot(), key[0], key[1], AUTO_DELETE_SECONDS, reset=True
+            )
     except BadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             log.debug("Could not edit status message: %s", exc)
     except TelegramError as exc:
         log.debug("Could not edit status message: %s", type(exc).__name__)
+    except Exception as exc:
+        log.debug("Could not refresh status message expiry (%s)", type(exc).__name__)
 
 
 async def _upload_retry(send_callable):
@@ -1592,6 +1870,7 @@ async def _run_pipeline(
         status = await message.reply_text(
             "Fetching subtitles…" if subtitles else "Preparing your MP3…" if mp3 else "Starting download…"
         )
+        schedule_auto_delete(context, status, reset=True)
     add_history(uid, url)
     # Remove the user's source-link/command text later; uploaded media messages are not scheduled.
     schedule_auto_delete(context, message)
@@ -1622,14 +1901,14 @@ async def _run_pipeline(
                     if sent:
                         suffix = " Oversized subtitle files were not sent." if oversized_subtitles else ""
                         await safe_edit(status, f"Finished. Sent {sent} subtitle file(s).{suffix}")
-                        schedule_auto_delete(context, status)
+                        schedule_auto_delete(context, status, reset=True)
                         return True
                     if oversized_subtitles:
                         await safe_edit(status, "Subtitle files were found, but they exceed the Telegram upload limit.")
-                        schedule_auto_delete(context, status)
+                        schedule_auto_delete(context, status, reset=True)
                         return False
                     await safe_edit(status, "No subtitles were available in the requested languages.")
-                    schedule_auto_delete(context, status)
+                    schedule_auto_delete(context, status, reset=True)
                     return False
                 finally:
                     shutil.rmtree(subdir, ignore_errors=True)
@@ -1751,7 +2030,7 @@ async def _run_pipeline(
 
                 if upload_error:
                     await safe_edit(status, f"Downloaded {sent}/{total_count} file(s), but an upload failed ({upload_error}). Please retry.")
-                    schedule_auto_delete(context, status)
+                    schedule_auto_delete(context, status, reset=True)
                     return False
 
                 counted_sources: set[int] = set()
@@ -1771,7 +2050,7 @@ async def _run_pipeline(
                 if progress.get("instagram_gallery_warning"):
                     final_note += " Some photo slides could not be fetched anonymously."
                 await safe_edit(status, final_note)
-                schedule_auto_delete(context, status)
+                schedule_auto_delete(context, status, reset=True)
                 return True
 
             if _is_instagram_url(url):
@@ -1782,13 +2061,13 @@ async def _run_pipeline(
                         "Try again later or use a reel that is publicly accessible without signing in; the bot cannot guarantee downloads when Instagram blocks unauthenticated access."
                     )
             await safe_edit(status, f"Download failed: {last_error}")
-            schedule_auto_delete(context, status)
+            schedule_auto_delete(context, status, reset=True)
             return False
     except Exception as exc:
         log.exception("Unexpected download pipeline failure")
         await safe_edit(status, f"Something went wrong ({type(exc).__name__}). Please try again later.")
         if status is not None:
-            schedule_auto_delete(context, status)
+            schedule_auto_delete(context, status, reset=True)
         return False
 
 
@@ -1837,6 +2116,8 @@ def _expand_playlist_links(url: str) -> list[str]:
             payload = json.loads(result.stdout or "{}")
         except json.JSONDecodeError as exc:
             raise RuntimeError("The playlist response was not valid JSON.") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("The playlist response had an unexpected format.")
         entries = payload.get("entries") or []
         links: list[str] = []
         for entry in entries:
@@ -1851,8 +2132,14 @@ def _expand_playlist_links(url: str) -> list[str]:
                 extractor = str(entry.get("ie_key") or entry.get("extractor_key") or "").lower()
                 if "youtube" in extractor or _is_youtube_url(url):
                     target = f"https://www.youtube.com/watch?v={entry['id']}"
-            if target and target not in links:
-                links.append(str(target))
+            if target:
+                try:
+                    target = validate_url(str(target))
+                except ValueError:
+                    log.warning("Skipping invalid URL in playlist metadata")
+                    continue
+                if target not in links:
+                    links.append(target)
             if len(links) >= MAX_PLAYLIST:
                 break
         if not links:
@@ -1906,19 +2193,23 @@ async def _download_batch_locked(
                 playlist_links = await asyncio.get_running_loop().run_in_executor(
                     pool, lambda link=url: _expand_playlist_links(link)
                 )
-                remaining = MAX_BATCH_LINKS - len(expanded)
-                expanded.extend(playlist_links[:remaining])
+                for playlist_link in playlist_links:
+                    if playlist_link not in expanded:
+                        expanded.append(playlist_link)
+                    if len(expanded) >= MAX_BATCH_LINKS:
+                        break
             else:
-                expanded.append(url)
+                if url not in expanded:
+                    expanded.append(url)
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError, TimeoutError) as exc:
             setup_failures += 1
             log.warning("Could not queue URL %s (%s)", position, type(exc).__name__)
     if not expanded:
         await safe_edit(setup_status, "No downloadable links could be queued. Check that the links are public and valid.")
-        schedule_auto_delete(context, setup_status)
+        schedule_auto_delete(context, setup_status, reset=True)
         return
     await safe_edit(setup_status, f"Queue ready: {len(expanded)} link(s). Downloads will run one at a time.")
-    schedule_auto_delete(context, setup_status)
+    schedule_auto_delete(context, setup_status, reset=True)
     successes = 0
     for index, link in enumerate(expanded, start=1):
         # Do not reply to the original user message here: its auto-delete timer may
@@ -1927,6 +2218,7 @@ async def _download_batch_locked(
             chat_id=message.chat_id,
             text=f"Queue item {index}/{len(expanded)}: starting…",
         )
+        schedule_auto_delete(context, item_status)
         ok = await _run_pipeline(update, context, link, status=item_status)
         successes += int(ok)
         if index < len(expanded):
@@ -2009,12 +2301,21 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
     # Source URL messages are temporary too; only bot text is cleaned by the helper below.
     schedule_auto_delete(context, update.effective_message)
     status = await update.effective_message.reply_text("Reading available video qualities…")
-    meta = await asyncio.get_running_loop().run_in_executor(context.bot_data["pool"], lambda: _get_video_meta(url))
+    schedule_auto_delete(context, status)
+    try:
+        meta = await asyncio.get_running_loop().run_in_executor(
+            context.bot_data["pool"], lambda: _get_video_meta(url)
+        )
+    except Exception as exc:
+        log.warning("YouTube quality metadata lookup failed (%s); falling back to automatic download",
+                    type(exc).__name__)
+        meta = None
     if not meta:
         try:
             await status.delete()
+            cancel_auto_delete(status)
         except TelegramError:
-            pass
+            schedule_auto_delete(context, status, reset=True)
         await download_job(update, context, url)
         return
 
@@ -2028,8 +2329,9 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
     if not options:
         try:
             await status.delete()
+            cancel_auto_delete(status)
         except TelegramError:
-            pass
+            schedule_auto_delete(context, status, reset=True)
         await download_job(update, context, url)
         return
 
@@ -2067,8 +2369,9 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
     caption += "\nQuality buttons select a maximum resolution; compatible H.264 streams are preferred for faster playback."
     try:
         await status.delete()
+        cancel_auto_delete(status)
     except TelegramError:
-        pass
+        schedule_auto_delete(context, status, reset=True)
     keyboard = InlineKeyboardMarkup(rows)
     sent = None
     thumbnail_url = str(meta.get("thumbnail") or "")
@@ -2112,8 +2415,13 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
     data = query.data or ""
+    # Avoid sending a fresh chat message for each repeated tap while a download is active.
+    if (data.startswith(("yq:", "ya:", "ym:", "pick_"))
+            and query.from_user.id in _active_users):
+        await query.answer("A download is already running. Please wait for it to finish.", show_alert=True)
+        return
+    await query.answer()
     # Self-contained YouTube callbacks remain valid if Render restarts and loses RAM state.
     if data.startswith(("yq:", "ya:", "ym:")):
         try:
@@ -2126,6 +2434,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 if len(fields) != 4:
                     raise ValueError("invalid quality callback")
                 height, owner = int(fields[2]), int(fields[3])
+                if height not in {1080, 720, 480, 360, 240, 144}:
+                    raise ValueError("unsupported quality")
             else:
                 if len(fields) != 3:
                     raise ValueError("invalid callback")
@@ -2275,30 +2585,13 @@ async def handle_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     status = await reply_text_auto(context, message, "Reading the playlist…")
     try:
         async with context.bot_data["download_semaphore"]:
-            with tempfile.TemporaryDirectory(prefix="dlplaylist_", dir=WORK_DIR) as td:
-                command = ["yt-dlp", "--ignore-config", "--dump-single-json", "--flat-playlist",
-                           "--playlist-end", str(MAX_PLAYLIST), "--no-warnings", "--remote-components", "ejs:github"]
-                command += _cookie_args(td)
-                command.append(url)
-                try:
-                    result = await asyncio.get_running_loop().run_in_executor(
-                        context.bot_data["pool"], lambda: _run_capture(command, 120)
-                    )
-                    payload = json.loads(result.stdout) if result.returncode == 0 else {}
-                    entries = payload.get("entries") or []
-                    links = []
-                    for entry in entries:
-                        target = entry.get("webpage_url") or entry.get("original_url")
-                        if not target:
-                            raw = entry.get("url")
-                            if isinstance(raw, str) and raw.startswith(("http://", "https://")):
-                                target = raw
-                        if target:
-                            links.append(target)
-                    links = links[:MAX_PLAYLIST]
-                except (ValueError, OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
-                    log.warning("Playlist extraction failed (%s)", type(exc).__name__)
-                    links = []
+            try:
+                links = await asyncio.get_running_loop().run_in_executor(
+                    context.bot_data["pool"], lambda: _expand_playlist_links(url)
+                )
+            except (ValueError, RuntimeError, OSError, subprocess.SubprocessError, TimeoutError) as exc:
+                log.warning("Playlist extraction failed (%s)", type(exc).__name__)
+                links = []
             if not links:
                 await safe_edit(status, "I couldn't read this playlist. It may be private, unsupported, or empty.")
                 return
@@ -2313,6 +2606,7 @@ async def handle_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     await asyncio.sleep(1.05)
             await safe_edit(status, f"Playlist finished: {successes}/{len(links)} item(s) sent successfully.")
     finally:
+        schedule_auto_delete(context, status, reset=True)
         _active_users.discard(user.id)
 
 
@@ -2364,36 +2658,79 @@ async def handle_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await reply_text_auto(context, update.effective_message, f"Diagnostic failed ({type(exc).__name__}).")
 
 # --------------------------- Health endpoint and startup recovery ---------------------------
-def start_health_server() -> None:
+def start_health_server(
+    *,
+    app: Application | None = None,
+    event_loop: asyncio.AbstractEventLoop | None = None,
+    webhook_secret: str | None = None,
+    webhook_path: str | None = None,
+) -> ThreadingHTTPServer:
+    """Serve health checks and, in webhook mode, authenticated Telegram updates."""
     port = int(os.environ.get("PORT", "10000"))
+    path_expected = webhook_path or WEBHOOK_PATH
+    secret_expected = webhook_secret or WEBHOOK_SECRET
 
     class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
-            if self.path not in {"/", "/health", "/healthz"}:
-                self.send_response(404)
-                self.end_headers()
-                return
-            now = time.monotonic()
-            healthy = (BOT_READY and LAST_TELEGRAM_OK and now - LAST_TELEGRAM_OK < 600)
-            still_starting = (not BOT_READY and now - SERVICE_BOOT_TIME < 180)
-            status = 200 if healthy or still_starting else 503
-            body = (b"ok\n" if status == 200 else b"telegram-unhealthy\n")
-            self.send_response(status)
+        def _respond(self, status_code: int, body: bytes) -> None:
+            self.send_response(status_code)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
+        def do_GET(self):  # noqa: N802
+            if self.path not in {"/", "/health", "/healthz"}:
+                self._respond(404, b"not-found\n")
+                return
+            now = time.monotonic()
+            healthy = bool(BOT_READY and LAST_TELEGRAM_OK and now - LAST_TELEGRAM_OK < 600)
+            still_starting = (not BOT_READY and now - SERVICE_BOOT_TIME < 180)
+            status = 200 if healthy or still_starting else 503
+            self._respond(status, b"ok\n" if status == 200 else b"telegram-unhealthy\n")
+
+        def do_POST(self):  # noqa: N802
+            if app is None or event_loop is None or self.path != path_expected:
+                self._respond(404, b"not-found\n")
+                return
+            received_secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if not hmac.compare_digest(received_secret, secret_expected):
+                self._respond(403, b"forbidden\n")
+                return
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._respond(400, b"bad-content-length\n")
+                return
+            if content_length <= 0 or content_length > 1_048_576:
+                self._respond(413, b"payload-too-large\n")
+                return
+            try:
+                payload = json.loads(self.rfile.read(content_length))
+                if not isinstance(payload, dict):
+                    raise ValueError("update must be a JSON object")
+                update = Update.de_json(payload, app.bot)
+                if update is None:
+                    raise ValueError("update is empty")
+                future = asyncio.run_coroutine_threadsafe(app.update_queue.put(update), event_loop)
+                future.result(timeout=10)
+            except Exception as exc:
+                log.warning("Rejected Telegram webhook update (%s)", type(exc).__name__)
+                self._respond(400, b"bad-update\n")
+                return
+            self._respond(200, b"ok\n")
+
         def log_message(self, *_args):
             return
 
-    def serve() -> None:
-        try:
-            ThreadingHTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
-        except Exception:
-            log.exception("Health endpoint failed to start")
-
-    threading.Thread(target=serve, daemon=True, name="health-server").start()
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    server.daemon_threads = True
+    threading.Thread(
+        target=lambda: server.serve_forever(poll_interval=0.5),
+        daemon=True,
+        name="telegram-health-webhook-server",
+    ).start()
+    log.info("HTTP health server listening on port %s", port)
+    return server
 
 
 async def _telegram_heartbeat(app: Application) -> None:
@@ -2409,6 +2746,12 @@ async def _telegram_heartbeat(app: Application) -> None:
 
 async def post_init(app: Application) -> None:
     global BOT_READY, LAST_TELEGRAM_OK
+    _recover_pending_auto_deletes(app)
+    if not DATABASE_URL:
+        log.warning(
+            "DATABASE_URL is not configured: auto-delete can recover only while the local state file survives; "
+            "Render Free restarts/spin-down can discard it."
+        )
     await app.bot.set_my_commands([
         BotCommand("start", "Show help and commands"),
         BotCommand("q", "Choose preferred video quality"),
@@ -2428,17 +2771,49 @@ async def post_init(app: Application) -> None:
     app.bot_data["heartbeat_task"] = asyncio.create_task(
         _telegram_heartbeat(app), name="telegram-heartbeat"
     )
+    if DATABASE_URL:
+        app.bot_data["delete_db_retry_task"] = asyncio.create_task(
+            _retry_auto_delete_database(app), name="auto-delete-db-retry"
+        )
     log.info("Telegram commands registered")
 
 
-async def post_stop(app: Application) -> None:
-    task = app.bot_data.pop("heartbeat_task", None)
-    if task is not None and not task.done():
-        task.cancel()
+async def _retry_auto_delete_database(app: Application) -> None:
+    """Retry transient Postgres outages and reload pending rows after reconnection."""
+    if not DATABASE_URL:
+        return
+    previously_ready = _DELETE_DB_READY
+    while True:
+        await asyncio.sleep(60)
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
+            ready = await asyncio.to_thread(_init_delete_db)
+        except Exception as exc:
+            log.warning("Auto-delete database retry failed (%s)", type(exc).__name__)
+            continue
+        if ready and not previously_ready:
+            # Reload rows that may have been missed while the database was unavailable.
+            _recover_pending_auto_deletes(app)
+            log.info("Auto-delete recovery completed after database reconnect")
+        previously_ready = ready
+
+
+async def post_stop(app: Application) -> None:
+    # Cancel ordinary asyncio timer tasks explicitly. Pending due times remain in
+    # persistent state/database and are restored the next time the bot starts.
+    for name in ("heartbeat_task", "delete_db_retry_task"):
+        task = app.bot_data.pop(name, None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    delete_tasks = list(_DELETE_TASKS.values())
+    for task in delete_tasks:
+        if not task.done():
+            task.cancel()
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
 
 
 def build_application() -> Application:
@@ -2485,10 +2860,80 @@ def check_runtime() -> None:
     log.info("Deno runtime: %s", deno or "not detected (some YouTube downloads may fail)")
 
 
+
+
+async def _run_webhook_service(app: Application) -> None:
+    """Run PTB using Telegram webhooks on the same port as Render health checks."""
+    global BOT_READY, LAST_TELEGRAM_OK, SERVICE_BOOT_TIME
+    if not WEBHOOK_BASE_URL.startswith("https://"):
+        raise RuntimeError(
+            "Webhook mode needs WEBHOOK_URL=https://your-service.onrender.com "
+            "or Render's RENDER_EXTERNAL_URL."
+        )
+    loop = asyncio.get_running_loop()
+    server: ThreadingHTTPServer | None = None
+    initialized = False
+    started = False
+    try:
+        await app.initialize()
+        initialized = True
+        await post_init(app)
+        await app.start()
+        started = True
+        server = start_health_server(
+            app=app,
+            event_loop=loop,
+            webhook_secret=WEBHOOK_SECRET,
+            webhook_path=WEBHOOK_PATH,
+        )
+        webhook_url = WEBHOOK_BASE_URL + WEBHOOK_PATH
+        await app.bot.set_webhook(
+            url=webhook_url,
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=False,
+        )
+        log.info("Telegram webhook registered at %s (secret value omitted)", webhook_url)
+        stop_event = asyncio.Event()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except (NotImplementedError, RuntimeError):
+                pass
+        await stop_event.wait()
+    finally:
+        if server is not None:
+            try:
+                await asyncio.to_thread(server.shutdown)
+                await asyncio.to_thread(server.server_close)
+            except Exception as exc:
+                log.warning("Webhook HTTP server shutdown issue (%s)", type(exc).__name__)
+        if started:
+            try:
+                await app.stop()
+            except Exception as exc:
+                log.warning("Telegram application shutdown issue (%s)", type(exc).__name__)
+        if initialized:
+            try:
+                await post_stop(app)
+            finally:
+                await app.shutdown()
+        BOT_READY = False
+        LAST_TELEGRAM_OK = 0.0
+
+
 def main() -> None:
     os.makedirs(WORK_DIR, exist_ok=True)
     check_runtime()
-    start_health_server()
+    if TELEGRAM_MODE == "webhook" and not WEBHOOK_BASE_URL:
+        raise RuntimeError(
+            "TELEGRAM_MODE=webhook requires WEBHOOK_URL or Render's RENDER_EXTERNAL_URL."
+        )
+    # Polling needs a health-only HTTP server. Webhook mode starts its combined health/
+    # webhook server only after the Telegram application is initialized.
+    if TELEGRAM_MODE == "polling":
+        start_health_server()
+    log.info("Telegram transport mode: %s", TELEGRAM_MODE)
     delay = 2
     global BOT_READY, LAST_TELEGRAM_OK, SERVICE_BOOT_TIME
     while True:
@@ -2500,9 +2945,14 @@ def main() -> None:
         try:
             app = build_application()
             pool = app.bot_data["pool"]
-            log.info("Starting Telegram bot polling")
-            app.run_polling(bootstrap_retries=-1, drop_pending_updates=False)
-            log.warning("Polling stopped cleanly; exiting restart loop")
+            if TELEGRAM_MODE == "webhook":
+                log.info("Starting Telegram webhook service")
+                asyncio.run(_run_webhook_service(app))
+                log.warning("Webhook service stopped cleanly; exiting restart loop")
+            else:
+                log.info("Starting Telegram bot polling")
+                app.run_polling(bootstrap_retries=-1, drop_pending_updates=False)
+                log.warning("Polling stopped cleanly; exiting restart loop")
             break
         except KeyboardInterrupt:
             log.info("Shutdown requested")

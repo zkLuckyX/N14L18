@@ -28,4 +28,5 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && ffmpeg -version | head -n 1
 COPY bot.py ./bot.py
 
+EXPOSE 10000
 CMD ["python", "-u", "bot.py"]
